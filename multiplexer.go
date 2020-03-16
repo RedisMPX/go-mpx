@@ -4,10 +4,13 @@ package mpx
 import (
 	"fmt"
 	"github.com/RedisMPX/go-mpx/internal/list"
-	"github.com/RedisMPX/go-mpx/types"
 	"github.com/gomodule/redigo/redis"
 	"time"
 )
+
+// A function that Subscriber will trigger every time a new message
+// is recevied on a Redis Pub/Sub channel that was added to it.
+type ListenerFunc = func(string, []byte)
 
 type request struct {
 	isUnsub bool
@@ -15,10 +18,10 @@ type request struct {
 	elem    *list.Element
 }
 
-// A multiplexer instance corresponds to one Redis Pub/Sub connection.
-// A single multiplexer can create multiple subscriptions that will reuse
+// A Multiplexer instance corresponds to one Redis Pub/Sub connection.
+// A single Multiplexer can create multiple subscriptions that will reuse
 // the same underlying connection. Use mpx.New() to create a new Multiplexer.
-// The multiplexer is safe for concurrent use.
+// The Multiplexer is safe for concurrent use.
 type Multiplexer struct {
 	pubsub    redis.PubSubConn
 	listeners map[string]*list.List
@@ -31,7 +34,7 @@ type Multiplexer struct {
 // to Redis at a time.
 func New(createConn func() redis.Conn) Multiplexer {
 	r := createConn()
-	mpx := multiplexer{
+	mpx := Multiplexer{
 		pubsub:    redis.PubSubConn{Conn: r},
 		listeners: make(map[string]*list.List),
 		reqCh:     make(chan request),
@@ -43,7 +46,11 @@ func New(createConn func() redis.Conn) Multiplexer {
 
 }
 
-func (mpx *Multiplexer) NewSubscription(fn types.ListenerFunc) Subscription {
+// Creates a new Subcription which will call the provided callback for every
+// message sent to it. See the documentation for Subscription to learn how to
+// add and remove channels to/from it.
+// Subscription instances are not safe for concurrent use.
+func (mpx *Multiplexer) NewSubscription(fn ListenerFunc) Subscription {
 	return createSubscription(mpx, fn)
 }
 

@@ -4,20 +4,20 @@ package mpx
 
 import (
 	"github.com/RedisMPX/go-mpx/internal/list"
-	"github.com/RedisMPX/go-mpx/types"
 )
 
 // A Subscription ties a callback to zero or more Redis Pub/Sub
 // channels through a single multiplexed connection.
 // Use the NewSubscription() method from Multiplexer to create a new Subscription.
+// Subscription instances are not safe for concurrent use.
 type Subscription struct {
-	mpx      *multiplexer
+	mpx      *Multiplexer
 	channels map[string]*list.Element
-	fn       types.ListenerFunc
+	fn       ListenerFunc
 }
 
-func createSubscription(mpx *multiplexer, fn types.ListenerFunc) Subscription {
-	return subscription{mpx, make(map[string]*list.Element), fn}
+func createSubscription(mpx *Multiplexer, fn ListenerFunc) Subscription {
+	return Subscription{mpx, make(map[string]*list.Element), fn}
 }
 
 // Adds a new Redis Pub/Sub channel to the Subscription.
