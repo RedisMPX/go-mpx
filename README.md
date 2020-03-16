@@ -1,6 +1,17 @@
 # go-mpx
 RedisMPX implementation for the Go programming language.
 
+## Abstract
+RedisMPX is a Redis Pub/Sub multiplexer written in multiple languages and livecoded on Twitch.
+
+[Twitch channel](twitch.tv/kristoff_it)
+[YouTube VOD archive](https://www.youtube.com/user/Kappaloris/videos)
+
+
+## Status
+This library is currently in Alpha, still main features missing. Don't use in production.
+
+
 
 ## Documentation
 - [API Reference](https://godoc.org/github.com/RedisMPX/go-mpx)
