@@ -26,11 +26,11 @@ type request struct {
 // the same underlying connection. Use mpx.New() to create a new Multiplexer.
 // The Multiplexer is safe for concurrent use.
 type Multiplexer struct {
+	createConn      func() redis.Conn
 	pubsub          redis.PubSubConn
+	inPubSubMode    bool
 	listeners       map[string]*list.List
 	reqCh           chan request
-	inPubSubMode    bool
-	createConn      func() redis.Conn
 	exit            chan struct{}
 	messages        chan redis.Message
 	mustReconnectCh chan struct{}
@@ -44,9 +44,9 @@ func New(createConn func() redis.Conn) Multiplexer {
 	size := 1000
 	mpx := Multiplexer{
 		pubsub:          redis.PubSubConn{Conn: createConn()},
+		createConn:      createConn,
 		listeners:       make(map[string]*list.List),
 		reqCh:           make(chan request, 100),
-		createConn:      createConn,
 		exit:            make(chan struct{}),
 		messages:        make(chan redis.Message, size),
 		mustReconnectCh: make(chan struct{}),
@@ -68,6 +68,10 @@ func (mpx *Multiplexer) NewSubscription(fn ListenerFunc) Subscription {
 	return createSubscription(mpx, fn)
 }
 
+func (mpx *Multiplexer) Close() {
+
+}
+
 // Ensures only one reconnection event happens at a time.
 // Goroutines should return *immediately* after calling this function.
 func (mpx *Multiplexer) triggerReconnect(_ error) {
@@ -84,45 +88,46 @@ func (mpx *Multiplexer) triggerReconnect(_ error) {
 }
 
 func (mpx *Multiplexer) reconnect() {
+	for {
+		// Wait for somebody to trigger a reconnection event.
+		<-mpx.mustReconnectCh
 
-	<-mpx.mustReconnectCh
+		// Kill all goroutines
+		mpx.exit <- struct{}{}
+		mpx.exit <- struct{}{}
 
-	// Kill all goroutines
-	mpx.exit <- struct{}{}
-	mpx.exit <- struct{}{}
+		// Reset the mustReconnect channel
+		mpx.mustReconnectCh = make(chan struct{})
 
-	// Reset the mustReconnect channel
-	mpx.mustReconnectCh = make(chan struct{})
+		// TODO MAYBE Ensure the msg channel is drained
 
-	// TODO MAYBE Ensure the msg channel is drained
+		// Close the old connection
+		if err := mpx.pubsub.Close(); err != nil {
+			// TODO: once we have some kind of logging,
+			//       maybe write a line about this minor failure.
+		}
 
-	// Close the old connection
-	if err := mpx.pubsub.Close(); err != nil {
-		// TODO: once we have some kind of logging,
-		//       maybe write a line about this minor failure.
+		// Open a new connection
+		mpx.pubsub = redis.PubSubConn{Conn: mpx.createConn()}
+
+		// Gather all Redis Pub/Sub channel names in a slice
+		chList := make([]interface{}, len(mpx.listeners))
+
+		var idx int
+		for ch := range mpx.listeners {
+			chList[idx] = ch
+			idx += 1
+		}
+
+		// Resubscribe to all the Redis Pub/Sub channels
+		if len(chList) > 0 {
+			mpx.pubsub.Subscribe(chList...)
+		}
+
+		// Restart the goroutines
+		go mpx.startSending()
+		go mpx.startReading(100)
 	}
-
-	// Open a new connection
-	mpx.pubsub = redis.PubSubConn{Conn: mpx.createConn()}
-
-	// Gather all Redis Pub/Sub channel names in a slice
-	chList := make([]interface{}, len(mpx.listeners))
-
-	var idx int
-	for ch := range mpx.listeners {
-		chList[idx] = ch
-		idx += 1
-	}
-
-	// Resubscribe to all the Redis Pub/Sub channels
-	if len(chList) > 0 {
-		mpx.pubsub.Subscribe(chList...)
-	}
-
-	// Restart the goroutines
-	go mpx.reconnect()
-	go mpx.startSending()
-	go mpx.startReading(100)
 }
 
 // TODO: WE NEED PIPELINING FOR SUBSCRIPTIONS and UNSUBSCRIPTIONS
@@ -199,6 +204,7 @@ func (mpx *Multiplexer) startSending() {
 				_, syncPingErr := mpx.pubsub.Conn.Do("PING")
 				if syncPingErr != nil {
 					mpx.triggerReconnect(syncPingErr)
+					return
 				}
 				healthy = true
 				continue
