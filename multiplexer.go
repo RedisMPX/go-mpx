@@ -4,6 +4,7 @@ package mpx
 import (
 	"errors"
 	"fmt"
+	"github.com/RedisMPX/go-mpx/internal"
 	"github.com/RedisMPX/go-mpx/internal/list"
 	"github.com/gomodule/redigo/redis"
 	"time"
@@ -26,7 +27,10 @@ type request struct {
 // the same underlying connection. Use mpx.New() to create a new Multiplexer.
 // The Multiplexer is safe for concurrent use.
 type Multiplexer struct {
-	createConn      func() redis.Conn
+	minBackOff time.Duration
+	maxBackOff time.Duration
+
+	createConn      func() (redis.Conn, error)
 	pubsub          redis.PubSubConn
 	inPubSubMode    bool
 	listeners       map[string]*list.List
@@ -40,10 +44,14 @@ type Multiplexer struct {
 // whenever called. The Multiplexer will only use it to create a new connection
 // in case of errors, meaning that a Multiplexer will only have one active connection
 // to Redis at a time.
-func New(createConn func() redis.Conn) Multiplexer {
+func New(createConn func() (redis.Conn, error)) Multiplexer {
 	size := 1000
+	// TODO: make this right
+	c, _ := createConn()
 	mpx := Multiplexer{
-		pubsub:          redis.PubSubConn{Conn: createConn()},
+		minBackOff:      8 * time.Millisecond,
+		maxBackOff:      512 * time.Millisecond,
+		pubsub:          redis.PubSubConn{Conn: c},
 		createConn:      createConn,
 		listeners:       make(map[string]*list.List),
 		reqCh:           make(chan request, 100),
@@ -81,10 +89,8 @@ func (mpx *Multiplexer) triggerReconnect(_ error) {
 	default:
 	}
 
-	select {
-	case <-mpx.exit:
-		return
-	}
+	// Drain the message that indicates the caller goroutine is exiting.
+	<-mpx.exit
 }
 
 func (mpx *Multiplexer) reconnect() {
@@ -96,9 +102,6 @@ func (mpx *Multiplexer) reconnect() {
 		mpx.exit <- struct{}{}
 		mpx.exit <- struct{}{}
 
-		// Reset the mustReconnect channel
-		mpx.mustReconnectCh = make(chan struct{})
-
 		// TODO MAYBE Ensure the msg channel is drained
 
 		// Close the old connection
@@ -108,7 +111,22 @@ func (mpx *Multiplexer) reconnect() {
 		}
 
 		// Open a new connection
-		mpx.pubsub = redis.PubSubConn{Conn: mpx.createConn()}
+		var c redis.Conn
+		var errorCount int
+		for {
+			var err error
+			c, err = mpx.createConn()
+			if err == nil {
+				// No error, got a good connection, we move forward.
+				break
+			}
+			if errorCount > 0 {
+				time.Sleep(internal.RetryBackoff(errorCount, mpx.minBackOff, mpx.maxBackOff))
+			}
+			errorCount++
+		}
+
+		mpx.pubsub = redis.PubSubConn{Conn: c}
 
 		// Gather all Redis Pub/Sub channel names in a slice
 		chList := make([]interface{}, len(mpx.listeners))

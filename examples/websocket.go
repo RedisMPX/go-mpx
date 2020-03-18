@@ -23,12 +23,8 @@ func main() {
 	// 	DB:       0,                // use default DB
 	// })
 
-	connBuilder := func() redis.Conn {
-		conn, err := redis.Dial("tcp", ":6379")
-		if err != nil {
-			panic(err)
-		}
-		return conn
+	connBuilder := func() (redis.Conn, error) {
+		return redis.Dial("tcp", ":6379")
 	}
 
 	multiplexer := mpx.New(connBuilder)
