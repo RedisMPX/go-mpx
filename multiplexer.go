@@ -27,17 +27,17 @@ type request struct {
 // the same underlying connection. Use mpx.New() to create a new Multiplexer.
 // The Multiplexer is safe for concurrent use.
 type Multiplexer struct {
-	minBackOff time.Duration
-	maxBackOff time.Duration
+	pingTimeout time.Duration
+	minBackOff  time.Duration
+	maxBackOff  time.Duration
 
 	createConn      func() (redis.Conn, error)
 	pubsub          redis.PubSubConn
-	inPubSubMode    bool
 	listeners       map[string]*list.List
 	reqCh           chan request
 	exit            chan struct{}
 	messages        chan redis.Message
-	mustReconnectCh chan struct{}
+	mustReconnectCh chan error
 }
 
 // Creates a new Multiplexer. The input function must provide a new connection
@@ -49,6 +49,7 @@ func New(createConn func() (redis.Conn, error)) Multiplexer {
 	// TODO: make this right
 	c, _ := createConn()
 	mpx := Multiplexer{
+		pingTimeout:     5 * time.Second,
 		minBackOff:      8 * time.Millisecond,
 		maxBackOff:      512 * time.Millisecond,
 		pubsub:          redis.PubSubConn{Conn: c},
@@ -57,7 +58,7 @@ func New(createConn func() (redis.Conn, error)) Multiplexer {
 		reqCh:           make(chan request, 100),
 		exit:            make(chan struct{}),
 		messages:        make(chan redis.Message, size),
-		mustReconnectCh: make(chan struct{}),
+		mustReconnectCh: make(chan error),
 	}
 
 	go mpx.reconnect()
@@ -82,10 +83,10 @@ func (mpx *Multiplexer) Close() {
 
 // Ensures only one reconnection event happens at a time.
 // Goroutines should return *immediately* after calling this function.
-func (mpx *Multiplexer) triggerReconnect(_ error) {
+func (mpx *Multiplexer) triggerReconnect(err error) {
 	// Try to trigger a reconnection.
 	select {
-	case mpx.mustReconnectCh <- struct{}{}:
+	case mpx.mustReconnectCh <- err:
 	default:
 	}
 
@@ -96,19 +97,20 @@ func (mpx *Multiplexer) triggerReconnect(_ error) {
 func (mpx *Multiplexer) reconnect() {
 	for {
 		// Wait for somebody to trigger a reconnection event.
-		<-mpx.mustReconnectCh
-
-		// Kill all goroutines
-		mpx.exit <- struct{}{}
-		mpx.exit <- struct{}{}
-
-		// TODO MAYBE Ensure the msg channel is drained
+		err := <-mpx.mustReconnectCh
+		fmt.Printf("Reconnect triggered, error: [%v]\n", err)
 
 		// Close the old connection
 		if err := mpx.pubsub.Close(); err != nil {
 			// TODO: once we have some kind of logging,
 			//       maybe write a line about this minor failure.
 		}
+
+		// Kill all goroutines
+		mpx.exit <- struct{}{}
+		mpx.exit <- struct{}{}
+
+		// TODO MAYBE Ensure the msg channel is drained
 
 		// Open a new connection
 		var c redis.Conn
@@ -150,10 +152,8 @@ func (mpx *Multiplexer) reconnect() {
 
 // TODO: WE NEED PIPELINING FOR SUBSCRIPTIONS and UNSUBSCRIPTIONS
 func (mpx *Multiplexer) startSending() {
-
-	const timeout = 30 * time.Second
 	healthy := true
-	activityTimer := time.NewTimer(timeout)
+	activityTimer := time.NewTimer(mpx.pingTimeout)
 
 	for {
 		select {
@@ -173,7 +173,6 @@ func (mpx *Multiplexer) startSending() {
 				} else {
 					fmt.Printf("[ws] unsubbed also from Redis\n")
 					delete(mpx.listeners, req.ch)
-					mpx.inPubSubMode = true
 					if err := mpx.pubsub.Unsubscribe(req.ch); err != nil {
 						mpx.triggerReconnect(err)
 						return
@@ -186,7 +185,6 @@ func (mpx *Multiplexer) startSending() {
 					listeners = list.New()
 					mpx.listeners[req.ch] = listeners
 					// Subscribe in Redis
-					mpx.inPubSubMode = true
 					if err := mpx.pubsub.Subscribe(req.ch); err != nil {
 						mpx.triggerReconnect(err)
 						return
@@ -205,20 +203,21 @@ func (mpx *Multiplexer) startSending() {
 				<-activityTimer.C
 			}
 
-			l, _ := mpx.listeners[msg.Channel]
-
-			for e := l.Front(); e != nil; e = e.Next() {
-				e.Value(msg.Channel, msg.Data)
+			l, ok := mpx.listeners[msg.Channel]
+			if ok {
+				for e := l.Front(); e != nil; e = e.Next() {
+					e.Value(msg.Channel, msg.Data)
+				}
 			}
 
 			// Now that we dispatched the message, we restart the timer.
-			activityTimer.Reset(timeout)
+			activityTimer.Reset(mpx.pingTimeout)
 
 		case <-activityTimer.C:
 			// The timer has triggered, we need to ping Redis.
-			activityTimer.Reset(timeout)
+			activityTimer.Reset(mpx.pingTimeout)
 
-			if !mpx.inPubSubMode {
+			if len(mpx.listeners) == 0 {
 				_, syncPingErr := mpx.pubsub.Conn.Do("PING")
 				if syncPingErr != nil {
 					mpx.triggerReconnect(syncPingErr)
@@ -255,10 +254,11 @@ func (mpx *Multiplexer) startReading(size int) {
 	const timeout = 30 * time.Second
 
 	dropMsgTimer := time.NewTimer(timeout)
-	dropMsgTimer.Stop()
+	if !dropMsgTimer.Stop() {
+		<-dropMsgTimer.C
+	}
 
 	for {
-		// Any message is as good as a ping.
 		select {
 		case <-mpx.exit:
 			return
@@ -268,8 +268,10 @@ func (mpx *Multiplexer) startReading(size int) {
 		switch msg := mpx.pubsub.Receive().(type) {
 		case redis.Subscription:
 			// Ignore.
+			mpx.messages <- redis.Message{"x", "x", []byte("x")}
 		case redis.Pong:
 			// Ignore.
+			mpx.messages <- redis.Message{"x", "x", []byte("x")}
 		case redis.Message:
 			dropMsgTimer.Reset(timeout)
 			select {
