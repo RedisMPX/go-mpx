@@ -7,6 +7,7 @@ import (
 	"github.com/RedisMPX/go-mpx/internal"
 	"github.com/RedisMPX/go-mpx/internal/list"
 	"github.com/gomodule/redigo/redis"
+	"strings"
 	"time"
 )
 
@@ -36,7 +37,7 @@ type Multiplexer struct {
 	listeners       map[string]*list.List
 	reqCh           chan request
 	exit            chan struct{}
-	messages        chan redis.Message
+	messages        chan interface{}
 	mustReconnectCh chan error
 }
 
@@ -57,7 +58,7 @@ func New(createConn func() (redis.Conn, error)) Multiplexer {
 		listeners:       make(map[string]*list.List),
 		reqCh:           make(chan request, 100),
 		exit:            make(chan struct{}),
-		messages:        make(chan redis.Message, size),
+		messages:        make(chan interface{}, size),
 		mustReconnectCh: make(chan error),
 	}
 
@@ -195,7 +196,7 @@ func (mpx *Multiplexer) startSending() {
 				listeners.AssimilateElement(req.elem)
 			}
 		// READ FROM REDIS PUB/SUB
-		case msg := <-mpx.messages:
+		case msgInterface := <-mpx.messages:
 			// We just received a message so we stop the counter that
 			// makes us produce PING messages.
 			healthy = true
@@ -203,11 +204,25 @@ func (mpx *Multiplexer) startSending() {
 				<-activityTimer.C
 			}
 
-			l, ok := mpx.listeners[msg.Channel]
-			if ok {
-				for e := l.Front(); e != nil; e = e.Next() {
-					e.Value(msg.Channel, msg.Data)
+			switch msg := msgInterface.(type) {
+			case redis.Pong:
+				// We need to receive pongs even if we discard them
+				// because they reset the activityTimer and prevent
+				// a reconnection event from happening.
+			case redis.Message:
+				l, ok := mpx.listeners[msg.Channel]
+				if ok {
+					for e := l.Front(); e != nil; e = e.Next() {
+						e.Value(msg.Channel, msg.Data)
+					}
 				}
+			case redis.Subscription:
+				// l, ok := mpx.listeners[msg.Channel]
+				// if ok {
+				// 	for e := l.Front(); e != nil; e = e.Next() {
+				// 		e.Value(msg.Channel, msg.Data)
+				// 	}
+				// }
 			}
 
 			// Now that we dispatched the message, we restart the timer.
@@ -218,7 +233,10 @@ func (mpx *Multiplexer) startSending() {
 			activityTimer.Reset(mpx.pingTimeout)
 
 			if len(mpx.listeners) == 0 {
-				_, syncPingErr := mpx.pubsub.Conn.Do("PING")
+				syncPingErr := mpx.pubsub.Conn.Send("PING")
+				if syncPingErr == nil {
+					syncPingErr = mpx.pubsub.Conn.Flush()
+				}
 				if syncPingErr != nil {
 					mpx.triggerReconnect(syncPingErr)
 					return
@@ -251,13 +269,6 @@ func (mpx *Multiplexer) startSending() {
 }
 
 func (mpx *Multiplexer) startReading(size int) {
-	const timeout = 30 * time.Second
-
-	dropMsgTimer := time.NewTimer(timeout)
-	if !dropMsgTimer.Stop() {
-		<-dropMsgTimer.C
-	}
-
 	for {
 		select {
 		case <-mpx.exit:
@@ -266,28 +277,19 @@ func (mpx *Multiplexer) startReading(size int) {
 		}
 
 		switch msg := mpx.pubsub.Receive().(type) {
-		case redis.Subscription:
-			// Ignore.
-			mpx.messages <- redis.Message{"x", "x", []byte("x")}
-		case redis.Pong:
-			// Ignore.
-			mpx.messages <- redis.Message{"x", "x", []byte("x")}
-		case redis.Message:
-			dropMsgTimer.Reset(timeout)
-			select {
-			case mpx.messages <- msg:
-				if !dropMsgTimer.Stop() {
-					<-dropMsgTimer.C
-				}
-			case <-dropMsgTimer.C:
-				// drop message
-			}
 		case error:
-			fmt.Printf("error in Pubsub: %v", msg)
-			mpx.triggerReconnect(msg)
-			return
+			// This is a dirty hack to ignore ping replies
+			// coming from when the connection is not yet in
+			// pubsub mode.
+			// TODO: ask redigo do accept pings also from the pubsub
+			//       interface.
+			if !strings.HasSuffix(msg.Error(), "got type string") {
+				fmt.Printf("error in Pubsub: %v", msg)
+				mpx.triggerReconnect(msg)
+				return
+			}
 		default:
-			panic("???")
+			mpx.messages <- msg
 		}
 	}
 
