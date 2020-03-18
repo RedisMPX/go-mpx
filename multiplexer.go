@@ -270,12 +270,6 @@ func (mpx *Multiplexer) startSending() {
 
 func (mpx *Multiplexer) startReading(size int) {
 	for {
-		select {
-		case <-mpx.exit:
-			return
-		default:
-		}
-
 		switch msg := mpx.pubsub.Receive().(type) {
 		case error:
 			// This is a dirty hack to ignore ping replies
@@ -292,5 +286,4 @@ func (mpx *Multiplexer) startReading(size int) {
 			mpx.messages <- msg
 		}
 	}
-
 }
