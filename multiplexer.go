@@ -232,20 +232,15 @@ func (mpx *Multiplexer) startSending() {
 			// The timer has triggered, we need to ping Redis.
 			activityTimer.Reset(mpx.pingTimeout)
 
-			if len(mpx.listeners) == 0 {
-				syncPingErr := mpx.pubsub.Conn.Send("PING")
-				if syncPingErr == nil {
-					syncPingErr = mpx.pubsub.Conn.Flush()
-				}
-				if syncPingErr != nil {
-					mpx.triggerReconnect(syncPingErr)
-					return
-				}
-				healthy = true
-				continue
+			pingErr := mpx.pubsub.Conn.Send("PING")
+			if pingErr == nil {
+				pingErr = mpx.pubsub.Conn.Flush()
+			}
+			if pingErr != nil {
+				mpx.triggerReconnect(pingErr)
+				return
 			}
 
-			pingErr := mpx.pubsub.Ping("")
 			if healthy {
 				healthy = false
 			} else {
@@ -282,6 +277,7 @@ func (mpx *Multiplexer) startReading(size int) {
 				mpx.triggerReconnect(msg)
 				return
 			}
+			mpx.messages <- redis.Pong{}
 		default:
 			mpx.messages <- msg
 		}
