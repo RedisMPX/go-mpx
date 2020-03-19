@@ -9,21 +9,29 @@
 //		// do something with e.Value
 //	}
 //
+// This is a modified version of the original code where I (@kristoff-it)
+// added a way of manipulating Elements with reference semantics.
 package list
 
-type ListenerFunc = func(string, []byte)
-
+// START EDITS
 // This library really doesn't like the idea that users might want to move around nodes
 // without copying. I need reference semantics for identiy checking so none of the provided
 // APIs really fit the bill. For this reason I added a couple of new functions that allow
 // me to attach an externally created Element to a list.
-func NewElement(v ListenerFunc) *Element {
+
+// Creates a new Element that you should then use with AssimilateElement().
+func NewElement(v interface{}) *Element {
 	return &Element{Value: v}
 }
+
+// This new method lets you attach a new Element to a list by providing
+// a pointer to it.
 func (l *List) AssimilateElement(e *Element) *Element {
 	l.lazyInit()
 	return l.insert(e, l.root.prev)
 }
+
+// END EDITS
 
 // Element is an element of a linked list.
 type Element struct {
@@ -38,7 +46,7 @@ type Element struct {
 	list *List
 
 	// The value stored with this element.
-	Value ListenerFunc
+	Value interface{}
 }
 
 // Next returns the next list element or nil.
@@ -115,7 +123,7 @@ func (l *List) insert(e, at *Element) *Element {
 }
 
 // insertValue is a convenience wrapper for insert(&Element{Value: v}, at).
-func (l *List) insertValue(v ListenerFunc, at *Element) *Element {
+func (l *List) insertValue(v interface{}, at *Element) *Element {
 	return l.insert(&Element{Value: v}, at)
 }
 
@@ -150,7 +158,7 @@ func (l *List) move(e, at *Element) *Element {
 // Remove removes e from l if e is an element of list l.
 // It returns the element value e.Value.
 // The element must not be nil.
-func (l *List) Remove(e *Element) ListenerFunc {
+func (l *List) Remove(e *Element) interface{} {
 	if e.list == l {
 		// if e.list == l, l must have been initialized when e was inserted
 		// in l or l == nil (e is a zero Element) and l.remove will crash
@@ -160,13 +168,13 @@ func (l *List) Remove(e *Element) ListenerFunc {
 }
 
 // PushFront inserts a new element e with value v at the front of list l and returns e.
-func (l *List) PushFront(v ListenerFunc) *Element {
+func (l *List) PushFront(v interface{}) *Element {
 	l.lazyInit()
 	return l.insertValue(v, &l.root)
 }
 
 // PushBack inserts a new element e with value v at the back of list l and returns e.
-func (l *List) PushBack(v ListenerFunc) *Element {
+func (l *List) PushBack(v interface{}) *Element {
 	l.lazyInit()
 	return l.insertValue(v, l.root.prev)
 }
@@ -174,7 +182,7 @@ func (l *List) PushBack(v ListenerFunc) *Element {
 // InsertBefore inserts a new element e with value v immediately before mark and returns e.
 // If mark is not an element of l, the list is not modified.
 // The mark must not be nil.
-func (l *List) InsertBefore(v ListenerFunc, mark *Element) *Element {
+func (l *List) InsertBefore(v interface{}, mark *Element) *Element {
 	if mark.list != l {
 		return nil
 	}
@@ -185,7 +193,7 @@ func (l *List) InsertBefore(v ListenerFunc, mark *Element) *Element {
 // InsertAfter inserts a new element e with value v immediately after mark and returns e.
 // If mark is not an element of l, the list is not modified.
 // The mark must not be nil.
-func (l *List) InsertAfter(v ListenerFunc, mark *Element) *Element {
+func (l *List) InsertAfter(v interface{}, mark *Element) *Element {
 	if mark.list != l {
 		return nil
 	}

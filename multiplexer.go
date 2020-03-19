@@ -28,45 +28,67 @@ type request struct {
 // the same underlying connection. Use mpx.New() to create a new Multiplexer.
 // The Multiplexer is safe for concurrent use.
 type Multiplexer struct {
+	// Options
 	pingTimeout time.Duration
 	minBackOff  time.Duration
 	maxBackOff  time.Duration
 
+	// state
 	createConn      func() (redis.Conn, error)
 	pubsub          redis.PubSubConn
 	listeners       map[string]*list.List
 	reqCh           chan request
+	closeSubCh      chan *list.Element
 	exit            chan struct{}
 	messages        chan interface{}
 	mustReconnectCh chan error
+	subscriptions   *list.List
 }
 
 // Creates a new Multiplexer. The input function must provide a new connection
 // whenever called. The Multiplexer will only use it to create a new connection
 // in case of errors, meaning that a Multiplexer will only have one active connection
 // to Redis at a time.
-func New(createConn func() (redis.Conn, error)) Multiplexer {
+func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	size := 1000
-	// TODO: make this right
-	c, _ := createConn()
+
 	mpx := Multiplexer{
 		pingTimeout:     5 * time.Second,
 		minBackOff:      8 * time.Millisecond,
 		maxBackOff:      512 * time.Millisecond,
-		pubsub:          redis.PubSubConn{Conn: c},
+		pubsub:          redis.PubSubConn{Conn: nil},
 		createConn:      createConn,
 		listeners:       make(map[string]*list.List),
 		reqCh:           make(chan request, 100),
+		closeSubCh:      make(chan *list.Element, 100),
 		exit:            make(chan struct{}),
 		messages:        make(chan interface{}, size),
 		mustReconnectCh: make(chan error),
+		subscriptions:   list.New(),
 	}
+
+	var c redis.Conn
+	var errorCount int
+	for {
+		var err error
+		c, err = mpx.createConn()
+		if err == nil {
+			// No error, got a good connection, we move forward.
+			break
+		}
+		if errorCount > 0 {
+			time.Sleep(internal.RetryBackoff(errorCount, mpx.minBackOff, mpx.maxBackOff))
+		}
+		errorCount++
+	}
+
+	mpx.pubsub.Conn = c
 
 	go mpx.reconnect()
 	go mpx.startSending()
 	go mpx.startReading(100)
 
-	return mpx
+	return &mpx
 
 }
 
@@ -74,8 +96,13 @@ func New(createConn func() (redis.Conn, error)) Multiplexer {
 // message sent to it. See the documentation for Subscription to learn how to
 // add and remove channels to/from it.
 // Subscription instances are not safe for concurrent use.
-func (mpx *Multiplexer) NewSubscription(fn ListenerFunc) Subscription {
-	return createSubscription(mpx, fn)
+func (mpx *Multiplexer) NewSubscription(fn ListenerFunc, reconnectFunc func()) Subscription {
+	if fn == nil {
+		panic("ListenerFunc cannot be nil")
+	}
+	subscriptionNode := createSubscription(mpx, fn, reconnectFunc)
+	mpx.subscriptions.AssimilateElement(subscriptionNode)
+	return subscriptionNode.Value.(Subscription)
 }
 
 func (mpx *Multiplexer) Close() {
@@ -145,6 +172,14 @@ func (mpx *Multiplexer) reconnect() {
 			mpx.pubsub.Subscribe(chList...)
 		}
 
+		for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
+			reconnFunc := e.Value.(Subscription).reconnectFunc
+
+			if reconnFunc != nil {
+				reconnFunc()
+			}
+		}
+
 		// Restart the goroutines
 		go mpx.startSending()
 		go mpx.startReading(100)
@@ -158,6 +193,9 @@ func (mpx *Multiplexer) startSending() {
 
 	for {
 		select {
+		case node := <-mpx.closeSubCh:
+			mpx.subscriptions.Remove(node)
+			println("yep, bye")
 		case req := <-mpx.reqCh:
 			listeners, ok := mpx.listeners[req.ch]
 
@@ -185,15 +223,20 @@ func (mpx *Multiplexer) startSending() {
 				if !ok {
 					listeners = list.New()
 					mpx.listeners[req.ch] = listeners
+				}
+
+				// Store the listener function
+				listeners.AssimilateElement(req.elem)
+
+				// Leaving the Networked I/O for last so that failures
+				// don't leave us in an inconsistent state.
+				if !ok {
 					// Subscribe in Redis
 					if err := mpx.pubsub.Subscribe(req.ch); err != nil {
 						mpx.triggerReconnect(err)
 						return
 					}
 				}
-
-				// Store the listener function
-				listeners.AssimilateElement(req.elem)
 			}
 		// READ FROM REDIS PUB/SUB
 		case msgInterface := <-mpx.messages:
@@ -213,7 +256,7 @@ func (mpx *Multiplexer) startSending() {
 				l, ok := mpx.listeners[msg.Channel]
 				if ok {
 					for e := l.Front(); e != nil; e = e.Next() {
-						e.Value(msg.Channel, msg.Data)
+						e.Value.(ListenerFunc)(msg.Channel, msg.Data)
 					}
 				}
 			case redis.Subscription:
@@ -251,14 +294,8 @@ func (mpx *Multiplexer) startSending() {
 				mpx.triggerReconnect(pingErr)
 				return
 			}
-		default:
-			// TODO: test is this is really giving higher priority to draining the msg channel
-			// we want this to avoid the case where a leftover msg gets delivered like 30s later
-			select {
-			case <-mpx.exit:
-				return
-			default:
-			}
+		case <-mpx.exit:
+			return
 		}
 	}
 }

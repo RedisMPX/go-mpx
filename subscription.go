@@ -11,23 +11,38 @@ import (
 // Use the NewSubscription() method from Multiplexer to create a new Subscription.
 // Subscription instances are not safe for concurrent use.
 type Subscription struct {
-	mpx      *Multiplexer
-	channels map[string]*list.Element
-	fn       ListenerFunc
+	mpx             *Multiplexer
+	channels        map[string]*list.Element
+	fn              ListenerFunc
+	reconnectFunc   func()
+	multiplexerNode *list.Element
+	closed          bool
 }
 
-func createSubscription(mpx *Multiplexer, fn ListenerFunc) Subscription {
-	return Subscription{mpx, make(map[string]*list.Element), fn}
+func createSubscription(mpx *Multiplexer, fn ListenerFunc, reconnectFunc func()) *list.Element {
+	node := list.NewElement(nil)
+	node.Value = Subscription{
+		mpx,
+		make(map[string]*list.Element),
+		fn,
+		reconnectFunc,
+		node,
+		false,
+	}
+	return node
 }
 
 // Adds a new Redis Pub/Sub channel to the Subscription.
 func (s *Subscription) Add(chans ...string) {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
 	for _, ch := range chans {
 		_, ok := s.channels[ch]
 		if !ok {
-			elem := list.NewElement(s.fn)
-			s.mpx.reqCh <- request{false, ch, elem}
-			s.channels[ch] = elem
+			node := list.NewElement(s.fn)
+			s.mpx.reqCh <- request{false, ch, node}
+			s.channels[ch] = node
 		}
 	}
 }
@@ -36,10 +51,13 @@ func (s *Subscription) Add(chans ...string) {
 
 // Removes a previously added Redis Pub/Sub channel from the Subscription.
 func (s *Subscription) Remove(chans ...string) {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
 	for _, ch := range chans {
-		elem, ok := s.channels[ch]
+		node, ok := s.channels[ch]
 		if ok {
-			s.mpx.reqCh <- request{true, ch, elem}
+			s.mpx.reqCh <- request{true, ch, node}
 			delete(s.channels, ch)
 		}
 	}
@@ -48,6 +66,9 @@ func (s *Subscription) Remove(chans ...string) {
 // Checks if a given Redis Pub/Sub channel is part of this subscription.
 // Complexity is O(1).
 func (s Subscription) HasChannel(ch string) bool {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
 	_, ok := s.channels[ch]
 	return ok
 }
@@ -55,6 +76,9 @@ func (s Subscription) HasChannel(ch string) bool {
 // Returns a list of all Redis Pub/Sub channels present in the Subscription.
 // The list is computed on-demand.
 func (s Subscription) GetChannels() []string {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
 	chList := make([]string, len(s.channels))
 
 	var idx int
@@ -68,10 +92,26 @@ func (s Subscription) GetChannels() []string {
 
 // Removes all Redis Pub/Sub channels from the Subscription.
 func (s *Subscription) Clear() {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
 	for ch := range s.channels {
 		s.Remove(ch)
 	}
 
 	// Reset our internal state
 	s.channels = make(map[string]*list.Element)
+}
+
+// Calls Clear() and
+func (s *Subscription) Close() {
+	if s.closed {
+		panic("tried to use a closed subscription")
+	}
+
+	println("sub is being closed")
+
+	s.Clear()
+	s.closed = true
+	s.mpx.closeSubCh <- s.multiplexerNode
 }

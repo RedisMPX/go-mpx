@@ -36,24 +36,25 @@ func main() {
 			return
 		}
 
-		sub := multiplexer.NewSubscription(func(ch string, msg []byte) {
+		listenerFn := func(ch string, msg []byte) {
 			if err := websocket.WriteJSON(conn, string(msg)); err != nil {
 				log.Println(err)
 				return
 			}
-		})
+		}
 
-		// TODO: abstract the current client away so that you can implement some error reporting
-		// (or try to get the current client to tell you by using the other, lower-level, API)
-		// sub.SetOnReconnect(func() {
-		// 	if err := websocket.WriteJSON(conn, "<Reconnected>"); err != nil {
-		// 		log.Println(err)
-		// 		return
-		// 	}
-		// })
+		reconnectFn := func() {
+			if err := websocket.WriteJSON(conn, "<Reconnected>"); err != nil {
+				log.Println(err)
+				return
+			}
+		}
+
+		sub := multiplexer.NewSubscription(listenerFn, reconnectFn)
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {
+			defer sub.Close()
 			for {
 				_, p, err := conn.ReadMessage()
 				if err != nil {
