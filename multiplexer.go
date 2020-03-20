@@ -210,32 +210,12 @@ func (mpx *Multiplexer) offlineProcessing() {
 }
 
 func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
-	listeners, ok := mpx.listeners[req.ch]
-
-	if req.reqType == subscriptionClose {
+	switch req.reqType {
+	case subscriptionClose:
 		mpx.subscriptions.Remove(req.elem)
-	} else if req.reqType == subscriptionRemove {
-		// REMOVE
-		if !ok {
-			return nil
-		}
+	case subscriptionAdd:
+		listeners, ok := mpx.listeners[req.ch]
 
-		listeners.Remove(req.elem)
-
-		if listeners.Len() > 0 {
-			fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
-		} else {
-			fmt.Printf("[ws] unsubbed also from Redis\n")
-			delete(mpx.listeners, req.ch)
-			if networkIO {
-				if err := mpx.pubsub.Unsubscribe(req.ch); err != nil {
-					return err
-				}
-			}
-		}
-
-	} else if req.reqType == subscriptionAdd {
-		// ADD
 		if !ok {
 			listeners = list.New()
 			mpx.listeners[req.ch] = listeners
@@ -254,8 +234,28 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 				}
 			}
 		}
-	}
+	case subscriptionRemove:
+		listeners, ok := mpx.listeners[req.ch]
 
+		if !ok {
+			return nil
+		}
+
+		listeners.Remove(req.elem)
+
+		if listeners.Len() > 0 {
+			fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
+		} else {
+			fmt.Printf("[ws] unsubbed also from Redis\n")
+			delete(mpx.listeners, req.ch)
+			if networkIO {
+				if err := mpx.pubsub.Unsubscribe(req.ch); err != nil {
+					return err
+				}
+			}
+		}
+
+	}
 	return nil
 }
 
