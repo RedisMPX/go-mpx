@@ -8,6 +8,7 @@ import (
 	"github.com/RedisMPX/go-mpx/internal/list"
 	"github.com/gomodule/redigo/redis"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,14 +55,17 @@ type Multiplexer struct {
 	maxBackOff  time.Duration
 
 	// state
-	createConn      func() (redis.Conn, error)
-	pubsub          redis.PubSubConn
-	listeners       map[string]*list.List
-	reqCh           chan request
-	stop            chan struct{}
-	messages        chan interface{}
-	mustReconnectCh chan error
-	subscriptions   *list.List
+	createConn       func() (redis.Conn, error)
+	pubsub           redis.PubSubConn
+	channels         map[string]*list.List
+	reqCh            chan request
+	stop             chan struct{}
+	exit             chan struct{}
+	stopWG           sync.WaitGroup
+	readerGoroExitWG sync.WaitGroup
+	messages         chan interface{}
+	mustReconnectCh  chan error
+	subscriptions    *list.List
 }
 
 // Creates a new Multiplexer. The input function must provide a new connection
@@ -75,24 +79,25 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	size := 1000
 
 	mpx := Multiplexer{
-		pingTimeout:     5 * time.Second,
-		minBackOff:      8 * time.Millisecond,
-		maxBackOff:      512 * time.Millisecond,
-		pubsub:          redis.PubSubConn{Conn: nil},
-		createConn:      createConn,
-		listeners:       make(map[string]*list.List),
-		reqCh:           make(chan request, 100),
-		stop:            make(chan struct{}),
-		messages:        make(chan interface{}, size),
-		mustReconnectCh: make(chan error),
-		subscriptions:   list.New(),
+		pingTimeout:      5 * time.Second,
+		minBackOff:       8 * time.Millisecond,
+		maxBackOff:       512 * time.Millisecond,
+		pubsub:           redis.PubSubConn{Conn: nil},
+		createConn:       createConn,
+		channels:         make(map[string]*list.List),
+		reqCh:            make(chan request, 100),
+		stop:             make(chan struct{}),
+		exit:             make(chan struct{}),
+		stopWG:           sync.WaitGroup{},
+		readerGoroExitWG: sync.WaitGroup{},
+		messages:         make(chan interface{}, size),
+		mustReconnectCh:  make(chan error),
+		subscriptions:    list.New(),
 	}
 
-	go mpx.reconnect()
-	mpx.mustReconnectCh <- nil
-
+	mpx.stopWG.Add(1)
+	go mpx.connectionGoroutine()
 	return &mpx
-
 }
 
 // Creates a new Subscription tied to the Multiplexer. Subscription instances
@@ -100,8 +105,8 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 // Subscription instances are not safe for concurrent use.
 // The arguments onDisconnect and onReconnect can be nil if you're not interested in the
 // corresponding type of events. All event listeners will be called sequentially from
-// a single goroutine. Try to keep all functions lean and offload slow operations to
-// another goroutine if necessary.
+// a single goroutine. Depending on the workload, consider keeping all functions lean
+// and offload slow operations to other goroutines if necessary.
 func (mpx *Multiplexer) NewSubscription(
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
@@ -115,8 +120,54 @@ func (mpx *Multiplexer) NewSubscription(
 	return subscriptionNode.Value.(Subscription)
 }
 
-func (mpx *Multiplexer) Close() {
+// Restarts a stopped Multiplexer. Calling Restart on a Multiplexer that was not
+// stopped will trigger a panic.
+func (mpx *Multiplexer) Restart() {
+	select {
+	case <-mpx.stop:
+		mpx.stop = make(chan struct{})
+		mpx.messages = make(chan interface{}, 100)
+		mpx.mustReconnectCh = make(chan error, 100)
+		mpx.stopWG.Add(1)
+		go mpx.connectionGoroutine()
+	default:
+		panic("called Restart non a Multiplexer that was not stopped")
+	}
+}
 
+// Stops all service goroutines and closes the underlying Redis Pub/Sub connection.
+// The Multiplexer will still be tied to the Subscriptions created from it, so
+// it's the callers duty to stop using those Subscriptions. Stopped Multiplexers
+// can be restarted (see Restart).
+func (mpx *Multiplexer) Stop() {
+	select {
+	case <-mpx.stop:
+		panic("called Stop on a Multiplexer that was already stopped")
+	default:
+	}
+
+	close(mpx.stop)
+	mpx.stopWG.Wait()
+
+	// Close the connection to make sure the reader goroutine exits.
+	// We might be tryng to exit before having established the first
+	// connection, so we need to check for it to be != nil.
+	if mpx.pubsub.Conn != nil {
+		if err := mpx.pubsub.Close(); err != nil {
+			// TODO: once we have some kind of logging,
+			//       maybe write a line about this minor failure.
+		}
+	}
+
+	// We wait for the messageReaderGoroutine to stop (if it's running)
+	mpx.readerGoroExitWG.Wait()
+
+	// Drain the mpx.messages channel.
+	// We also use this as a synchronization point with messageReaderGoroutine
+	close(mpx.messages)
+	for msg := range mpx.messages {
+		mpx.dispatchMessage(msg)
+	}
 }
 
 // Ensures only one reconnection event happens at a time.
@@ -129,7 +180,11 @@ func (mpx *Multiplexer) triggerReconnect(err error) {
 	}
 
 	// Drain the message that indicates the caller goroutine is exiting.
-	<-mpx.stop
+	// But always keep an eye on the stop channel.
+	select {
+	case <-mpx.exit:
+	case <-mpx.stop:
+	}
 }
 
 func (mpx *Multiplexer) openNewConnection() {
@@ -137,6 +192,12 @@ func (mpx *Multiplexer) openNewConnection() {
 	var c redis.Conn
 	var errorCount int
 	for {
+		select {
+		case <-mpx.stop:
+			return
+		default:
+		}
+
 		var err error
 		c, err = mpx.createConn()
 		if err == nil {
@@ -152,12 +213,13 @@ func (mpx *Multiplexer) openNewConnection() {
 	mpx.pubsub.Conn = c
 }
 
-func (mpx *Multiplexer) reconnect() {
+func (mpx *Multiplexer) connectionGoroutine() {
+	defer mpx.stopWG.Done()
+
+	// The first time we enter the loop we are trying
+	// to establish the connection for the first time.
+	var err error
 	for {
-		// Wait for somebody to trigger a reconnection event.
-		// If the error is nil, it means that this is the first
-		// connection attempt after instantiating the Multiplexer.
-		err := <-mpx.mustReconnectCh
 
 		if err != nil {
 			// Close the old connection
@@ -166,27 +228,40 @@ func (mpx *Multiplexer) reconnect() {
 				//       maybe write a line about this minor failure.
 			}
 
-			// Kill all goroutines
-			mpx.stop <- struct{}{}
-			mpx.stop <- struct{}{}
+			// Kill requestProcessingGoroutine and messageReadingGoroutine.
+			// While we want to block to push to mpx.exit twice, we also
+			// want to be able to exit if the Multiplexer was closed in the
+			// meantime.
+			for i := 0; i < 2; i += 1 {
+				select {
+				case mpx.exit <- struct{}{}:
+				case <-mpx.stop:
+					return
+				}
+			}
 		}
 
 		// Start an "emergency" goroutine that keeps processing
 		// requests without doing any I/O while we try to establish
 		// a new connection.
-		go mpx.offlineProcessing(err)
+		mpx.stopWG.Add(1)
+		go mpx.offlineProcessingGoroutine(err)
 
 		// Open a new connection.
 		mpx.openNewConnection()
 
 		// Stop the offline processing goroutine
-		mpx.stop <- struct{}{}
+		select {
+		case mpx.exit <- struct{}{}:
+		case <-mpx.stop:
+			return
+		}
 
 		// Gather all Redis Pub/Sub channel names in a slice
-		chList := make([]interface{}, len(mpx.listeners))
+		chList := make([]interface{}, len(mpx.channels))
 
 		var idx int
-		for ch := range mpx.listeners {
+		for ch := range mpx.channels {
 			chList[idx] = ch
 			idx += 1
 		}
@@ -197,13 +272,31 @@ func (mpx *Multiplexer) reconnect() {
 		}
 
 		// Restart the goroutines
-		go mpx.startSending()
-		go mpx.startReading(100)
+		mpx.stopWG.Add(1)
+		go mpx.requestProcessingGoroutine()
+		mpx.readerGoroExitWG.Add(1)
+		go mpx.messageReadingGoroutine(100)
+
+		// Wait for somebody to trigger a reconnection event.
+		// If the error is nil, it means that this is the first
+		// connection attempt after instantiating the Multiplexer.
+		select {
+		case err = <-mpx.mustReconnectCh:
+			select {
+			case <-mpx.stop:
+				return
+			default:
+			}
+		case <-mpx.stop:
+			return
+		}
 	}
 }
 
 // This goroutine is kinda like the emergency command hologram of this package.
-func (mpx *Multiplexer) offlineProcessing(err error) {
+func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
+	defer mpx.stopWG.Done()
+
 	// Drain the mpx.messages channel.
 	close(mpx.messages)
 	for msg := range mpx.messages {
@@ -226,9 +319,11 @@ func (mpx *Multiplexer) offlineProcessing(err error) {
 	// that a connecton has been re-established.
 	for {
 		select {
+		case <-mpx.stop:
+			return
 		case req := <-mpx.reqCh:
 			mpx.processRequest(req, false)
-		case <-mpx.stop:
+		case <-mpx.exit:
 			// Notify Subscriptions that we reconnected
 			if err != nil {
 				for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
@@ -249,11 +344,11 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 	case subscriptionClose:
 		mpx.subscriptions.Remove(req.elem)
 	case subscriptionAdd:
-		listeners, ok := mpx.listeners[req.ch]
+		listeners, ok := mpx.channels[req.ch]
 
 		if !ok {
 			listeners = list.New()
-			mpx.listeners[req.ch] = listeners
+			mpx.channels[req.ch] = listeners
 		}
 
 		// Store the listener function
@@ -270,7 +365,7 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 			}
 		}
 	case subscriptionRemove:
-		listeners, ok := mpx.listeners[req.ch]
+		listeners, ok := mpx.channels[req.ch]
 
 		if !ok {
 			return nil
@@ -282,7 +377,7 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 			fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
 		} else {
 			fmt.Printf("[ws] unsubbed also from Redis\n")
-			delete(mpx.listeners, req.ch)
+			delete(mpx.channels, req.ch)
 			if networkIO {
 				if err := mpx.pubsub.Unsubscribe(req.ch); err != nil {
 					return err
@@ -301,7 +396,7 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		// because they reset the activityTimer and prevent
 		// a reconnection event from happening.
 	case redis.Message:
-		l, ok := mpx.listeners[msg.Channel]
+		l, ok := mpx.channels[msg.Channel]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
 				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)
@@ -318,7 +413,9 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 }
 
 // TODO: WE NEED PIPELINING FOR SUBSCRIPTIONS and UNSUBSCRIPTIONS
-func (mpx *Multiplexer) startSending() {
+func (mpx *Multiplexer) requestProcessingGoroutine() {
+	defer mpx.stopWG.Done()
+
 	healthy := true
 	activityTimer := time.NewTimer(mpx.pingTimeout)
 
@@ -367,6 +464,8 @@ func (mpx *Multiplexer) startSending() {
 				mpx.triggerReconnect(pingErr)
 				return
 			}
+		case <-mpx.exit:
+			return
 		case <-mpx.stop:
 			return
 		}
@@ -374,12 +473,13 @@ func (mpx *Multiplexer) startSending() {
 }
 
 // Since we're forced to block with Receive() potentially forever,
-// there is no good way for us to peek into mpx.stop.
+// there is no good way for us to peek into mpx.exit.
 // As a consequence, if an error was reported from another
 // goroutine, the reconnect() procedure will try to close
 // the old connection to make sure Receive() returns
 // with an error, which will give us then an opporunity to exit.
-func (mpx *Multiplexer) startReading(size int) {
+func (mpx *Multiplexer) messageReadingGoroutine(size int) {
+	defer mpx.readerGoroExitWG.Done()
 	for {
 		switch msg := mpx.pubsub.Receive().(type) {
 		case error:
@@ -393,9 +493,17 @@ func (mpx *Multiplexer) startReading(size int) {
 				mpx.triggerReconnect(msg)
 				return
 			}
-			mpx.messages <- redis.Pong{}
+			select {
+			case mpx.messages <- redis.Pong{}:
+			case <-mpx.stop:
+				return
+			}
 		default:
-			mpx.messages <- msg
+			select {
+			case mpx.messages <- msg:
+			case <-mpx.stop:
+				return
+			}
 		}
 	}
 }

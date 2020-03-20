@@ -91,6 +91,12 @@ func main() {
 					// rClient.Close()
 				case '?':
 					fmt.Printf("[ws] active subscriptions: {%v}", sub.GetChannels())
+				case 'q':
+					multiplexer.Stop()
+					println("yep the multiplexer was closed")
+				case 'r':
+					multiplexer.Restart()
+					println("running!")
 				default:
 					continue
 				}
