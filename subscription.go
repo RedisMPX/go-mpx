@@ -20,7 +20,12 @@ type Subscription struct {
 	closed          bool
 }
 
-func createSubscription(mpx *Multiplexer, onMessage OnMessageFunc, onDisconnect OnDisconnectFunc, onReconnect OnReconnectFunc) *list.Element {
+func createSubscription(
+	mpx *Multiplexer,
+	onMessage OnMessageFunc,
+	onDisconnect OnDisconnectFunc,
+	onReconnect OnReconnectFunc,
+) *list.Element {
 	node := list.NewElement(nil)
 	node.Value = Subscription{
 		mpx,
