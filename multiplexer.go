@@ -21,7 +21,7 @@ type OnMessageFunc = func(channel string, message []byte)
 // connection has been lost. The error argument will be the error that
 // triggered the reconnection event.
 // Subscriber ensures that this function will be triggered *after* all
-// pending messages have been delivered.
+// pending messages have been dispatched.
 type OnDisconnectFunc = func(error)
 
 // A function that Subscriber will trigger once a connection has been
@@ -99,6 +99,10 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 // Creates a new Subscription tied to the Multiplexer. Subscription instances
 // must be closed (see the relative Close method) before being disposed of.
 // Subscription instances are not safe for concurrent use.
+// The arguments onDisconnect and onReconnect can be nil if you're not interested in the
+// corresponding type of events. All event listeners will be called sequentially from
+// a single goroutine. Try to keep all functions lean and offload slow operations to
+// another goroutine if necessary.
 func (mpx *Multiplexer) NewSubscription(onMessage OnMessageFunc, onDisconnect OnDisconnectFunc, onReconnect OnReconnectFunc) Subscription {
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
