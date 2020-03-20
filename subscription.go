@@ -41,7 +41,7 @@ func (s *Subscription) Add(chans ...string) {
 		_, ok := s.channels[ch]
 		if !ok {
 			node := list.NewElement(s.fn)
-			s.mpx.reqCh <- request{false, ch, node}
+			s.mpx.reqCh <- request{subscriptionAdd, ch, node}
 			s.channels[ch] = node
 		}
 	}
@@ -57,7 +57,7 @@ func (s *Subscription) Remove(chans ...string) {
 	for _, ch := range chans {
 		node, ok := s.channels[ch]
 		if ok {
-			s.mpx.reqCh <- request{true, ch, node}
+			s.mpx.reqCh <- request{subscriptionRemove, ch, node}
 			delete(s.channels, ch)
 		}
 	}
@@ -103,15 +103,14 @@ func (s *Subscription) Clear() {
 	s.channels = make(map[string]*list.Element)
 }
 
-// Calls Clear() and
+// Calls Clear() and frees all associated resources. After calling this method
+// the Subcription instance should not be used any more.
 func (s *Subscription) Close() {
 	if s.closed {
 		panic("tried to use a closed subscription")
 	}
 
-	println("sub is being closed")
-
 	s.Clear()
 	s.closed = true
-	s.mpx.closeSubCh <- s.multiplexerNode
+	s.mpx.reqCh <- request{subscriptionClose, "", s.multiplexerNode}
 }

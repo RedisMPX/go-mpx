@@ -17,8 +17,16 @@ var errPingTimeout = errors.New("redis: ping timeout")
 // is recevied on a Redis Pub/Sub channel that was added to it.
 type ListenerFunc = func(channel string, message []byte)
 
+type requestType int
+
+const (
+	subscriptionAdd requestType = iota
+	subscriptionRemove
+	subscriptionClose
+)
+
 type request struct {
-	isUnsub bool
+	reqType requestType
 	ch      string
 	elem    *list.Element
 }
@@ -38,7 +46,6 @@ type Multiplexer struct {
 	pubsub          redis.PubSubConn
 	listeners       map[string]*list.List
 	reqCh           chan request
-	closeSubCh      chan *list.Element
 	exit            chan struct{}
 	messages        chan interface{}
 	mustReconnectCh chan error
@@ -60,7 +67,6 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 		createConn:      createConn,
 		listeners:       make(map[string]*list.List),
 		reqCh:           make(chan request, 100),
-		closeSubCh:      make(chan *list.Element, 100),
 		exit:            make(chan struct{}),
 		messages:        make(chan interface{}, size),
 		mustReconnectCh: make(chan error),
@@ -195,8 +201,6 @@ func (mpx *Multiplexer) offlineProcessing() {
 	// that a connecton has been re-established.
 	for {
 		select {
-		case node := <-mpx.closeSubCh:
-			mpx.subscriptions.Remove(node)
 		case req := <-mpx.reqCh:
 			mpx.processRequest(req, false)
 		case <-mpx.exit:
@@ -208,7 +212,9 @@ func (mpx *Multiplexer) offlineProcessing() {
 func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 	listeners, ok := mpx.listeners[req.ch]
 
-	if req.isUnsub {
+	if req.reqType == subscriptionClose {
+		mpx.subscriptions.Remove(req.elem)
+	} else if req.reqType == subscriptionRemove {
 		// REMOVE
 		if !ok {
 			return nil
@@ -228,7 +234,7 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 			}
 		}
 
-	} else {
+	} else if req.reqType == subscriptionAdd {
 		// ADD
 		if !ok {
 			listeners = list.New()
@@ -283,9 +289,6 @@ func (mpx *Multiplexer) startSending() {
 
 	for {
 		select {
-		case node := <-mpx.closeSubCh:
-			mpx.subscriptions.Remove(node)
-			println("yep, bye")
 		case req := <-mpx.reqCh:
 			if err := mpx.processRequest(req, true); err != nil {
 				mpx.triggerReconnect(err)
