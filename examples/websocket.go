@@ -36,21 +36,28 @@ func main() {
 			return
 		}
 
-		listenerFn := func(ch string, msg []byte) {
+		onMessage := func(ch string, msg []byte) {
 			if err := websocket.WriteJSON(conn, string(msg)); err != nil {
 				log.Println(err)
 				return
 			}
 		}
 
-		reconnectFn := func() {
-			if err := websocket.WriteJSON(conn, "<Reconnected>"); err != nil {
+		onDisconnect := func(_ error) {
+			if err := websocket.WriteJSON(conn, "*Disconnected*"); err != nil {
 				log.Println(err)
 				return
 			}
 		}
 
-		sub := multiplexer.NewSubscription(listenerFn, reconnectFn)
+		onReconnect := func() {
+			if err := websocket.WriteJSON(conn, "*Reconnected*"); err != nil {
+				log.Println(err)
+				return
+			}
+		}
+
+		sub := multiplexer.NewSubscription(onMessage, onDisconnect, onReconnect)
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {

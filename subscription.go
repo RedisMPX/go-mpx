@@ -6,26 +6,28 @@ import (
 	"github.com/RedisMPX/go-mpx/internal/list"
 )
 
-// A Subscription ties a callback to zero or more Redis Pub/Sub
-// channels through a single multiplexed connection.
-// Use the NewSubscription() method from Multiplexer to create a new Subscription.
-// Subscription instances are not safe for concurrent use.
+// A Subscription ties a ListenerFunc to zero or more Redis Pub/Sub channels through
+// a single multiplexed connection. Use NewSubscription from Multiplexer to create a
+// new Subscription. Subscription instances are not safe for concurrent use.
+// Before disposing of a Subscription you must call Close.
 type Subscription struct {
 	mpx             *Multiplexer
 	channels        map[string]*list.Element
-	fn              ListenerFunc
-	reconnectFunc   func()
+	onMessage       OnMessageFunc
+	onDisconnect    OnDisconnectFunc
+	onReconnect     OnReconnectFunc
 	multiplexerNode *list.Element
 	closed          bool
 }
 
-func createSubscription(mpx *Multiplexer, fn ListenerFunc, reconnectFunc func()) *list.Element {
+func createSubscription(mpx *Multiplexer, onMessage OnMessageFunc, onDisconnect OnDisconnectFunc, onReconnect OnReconnectFunc) *list.Element {
 	node := list.NewElement(nil)
 	node.Value = Subscription{
 		mpx,
 		make(map[string]*list.Element),
-		fn,
-		reconnectFunc,
+		onMessage,
+		onDisconnect,
+		onReconnect,
 		node,
 		false,
 	}
@@ -40,7 +42,7 @@ func (s *Subscription) Add(chans ...string) {
 	for _, ch := range chans {
 		_, ok := s.channels[ch]
 		if !ok {
-			node := list.NewElement(s.fn)
+			node := list.NewElement(s.onMessage)
 			s.mpx.reqCh <- request{subscriptionAdd, ch, node}
 			s.channels[ch] = node
 		}
@@ -103,8 +105,8 @@ func (s *Subscription) Clear() {
 	s.channels = make(map[string]*list.Element)
 }
 
-// Calls Clear() and frees all associated resources. After calling this method
-// the Subcription instance should not be used any more.
+// Calls Clear and frees all associated resources. After calling this method
+// the Subcription instance cannot not be used any more.
 func (s *Subscription) Close() {
 	if s.closed {
 		panic("tried to use a closed subscription")

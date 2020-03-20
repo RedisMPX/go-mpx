@@ -15,7 +15,19 @@ var errPingTimeout = errors.New("redis: ping timeout")
 
 // A function that Subscriber will trigger every time a new message
 // is recevied on a Redis Pub/Sub channel that was added to it.
-type ListenerFunc = func(channel string, message []byte)
+type OnMessageFunc = func(channel string, message []byte)
+
+// A function that Subscriber will trigger every time the Redis Pub/Sub
+// connection has been lost. The error argument will be the error that
+// triggered the reconnection event.
+// Subscriber ensures that this function will be triggered *after* all
+// pending messages have been delivered.
+type OnDisconnectFunc = func(error)
+
+// A function that Subscriber will trigger once a connection has been
+// re-established. Subscriber ensures that this function will be triggered
+// *before* new messages start coming from the new connection.
+type OnReconnectFunc = func()
 
 type requestType int
 
@@ -31,10 +43,10 @@ type request struct {
 	elem    *list.Element
 }
 
-// A Multiplexer instance corresponds to one Redis Pub/Sub connection.
-// A single Multiplexer can create multiple subscriptions that will reuse
-// the same underlying connection. Use mpx.New() to create a new Multiplexer.
-// The Multiplexer is safe for concurrent use.
+// A Multiplexer instance corresponds to one Redis Pub/Sub connection that
+// will be shared by multiple Subscription instances.
+// A Multiplexer must be created with New.
+// Multiplexer instances are safe for concurrent use.
 type Multiplexer struct {
 	// Options
 	pingTimeout time.Duration
@@ -55,7 +67,8 @@ type Multiplexer struct {
 // Creates a new Multiplexer. The input function must provide a new connection
 // whenever called. The Multiplexer will only use it to create a new connection
 // in case of errors, meaning that a Multiplexer will only have one active connection
-// to Redis at a time.
+// to Redis at a time. Multiplexers will automatically try to reconnect using
+// an exponential backoff (plus jitter) algorithm.
 func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	size := 1000
 
@@ -83,15 +96,14 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 
 }
 
-// Creates a new Subcription which will call the provided callback for every
-// message sent to it. See the documentation for Subscription to learn how to
-// add and remove channels to/from it.
+// Creates a new Subscription tied to the Multiplexer. Subscription instances
+// must be closed (see the relative Close method) before being disposed of.
 // Subscription instances are not safe for concurrent use.
-func (mpx *Multiplexer) NewSubscription(fn ListenerFunc, reconnectFunc func()) Subscription {
-	if fn == nil {
-		panic("ListenerFunc cannot be nil")
+func (mpx *Multiplexer) NewSubscription(onMessage OnMessageFunc, onDisconnect OnDisconnectFunc, onReconnect OnReconnectFunc) Subscription {
+	if onMessage == nil {
+		panic("onMessage cannot be nil")
 	}
-	subscriptionNode := createSubscription(mpx, fn, reconnectFunc)
+	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onReconnect)
 	mpx.subscriptions.AssimilateElement(subscriptionNode)
 	return subscriptionNode.Value.(Subscription)
 }
@@ -152,7 +164,7 @@ func (mpx *Multiplexer) reconnect() {
 		// Start an "emergency" goroutine that keeps processing
 		// requests without doing any I/O while we try to establish
 		// a new connection.
-		go mpx.offlineProcessing()
+		go mpx.offlineProcessing(err)
 
 		// Open a new connection.
 		mpx.openNewConnection()
@@ -174,14 +186,6 @@ func (mpx *Multiplexer) reconnect() {
 			mpx.pubsub.Subscribe(chList...)
 		}
 
-		for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
-			reconnFunc := e.Value.(Subscription).reconnectFunc
-
-			if reconnFunc != nil {
-				reconnFunc()
-			}
-		}
-
 		// Restart the goroutines
 		go mpx.startSending()
 		go mpx.startReading(100)
@@ -189,13 +193,22 @@ func (mpx *Multiplexer) reconnect() {
 }
 
 // This goroutine is kinda like the emergency command hologram of this lib
-func (mpx *Multiplexer) offlineProcessing() {
+func (mpx *Multiplexer) offlineProcessing(err error) {
 	// Drain the mpx.messages channel.
 	close(mpx.messages)
 	for msg := range mpx.messages {
 		mpx.dispatchMessage(msg)
 	}
 	mpx.messages = make(chan interface{}, 100)
+
+	// Notify Subscriptions of the disconnection
+	for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
+		onDisconnect := e.Value.(Subscription).onDisconnect
+
+		if onDisconnect != nil {
+			onDisconnect(err)
+		}
+	}
 
 	// Keep processing requests until we're notified
 	// that a connecton has been re-established.
@@ -204,6 +217,14 @@ func (mpx *Multiplexer) offlineProcessing() {
 		case req := <-mpx.reqCh:
 			mpx.processRequest(req, false)
 		case <-mpx.exit:
+			// Notify Subscriptions that we reconnected
+			for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
+				onReconnect := e.Value.(Subscription).onReconnect
+
+				if onReconnect != nil {
+					onReconnect()
+				}
+			}
 			return
 		}
 	}
@@ -269,7 +290,7 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		l, ok := mpx.listeners[msg.Channel]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
-				e.Value.(ListenerFunc)(msg.Channel, msg.Data)
+				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)
 			}
 		}
 	case redis.Subscription:
