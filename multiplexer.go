@@ -100,8 +100,8 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	return &mpx
 }
 
-// Creates a new Subscription tied to the Multiplexer. Subscription instances
-// must be closed (see the relative Close method) before being disposed of.
+// Creates a new Subscription tied to the Multiplexer. Before disposing of a Subcription you
+// must call Close (see the relative Close method for extra advice).
 // Subscription instances are not safe for concurrent use.
 // The arguments onDisconnect and onReconnect can be nil if you're not interested in the
 // corresponding type of events. All event listeners will be called sequentially from
@@ -137,8 +137,8 @@ func (mpx *Multiplexer) Restart() {
 
 // Stops all service goroutines and closes the underlying Redis Pub/Sub connection.
 // The Multiplexer will still be tied to the Subscriptions created from it, so
-// it's the callers duty to stop using those Subscriptions. Stopped Multiplexers
-// can be restarted (see Restart).
+// it's the callers duty to avoid calling Add / Remove / Clear from those Subscriptions
+// while the Multiplexer is stopped. Stopped Multiplexers can be restarted (see Restart).
 func (mpx *Multiplexer) Stop() {
 	select {
 	case <-mpx.stop:

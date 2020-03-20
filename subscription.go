@@ -112,6 +112,8 @@ func (s *Subscription) Clear() {
 
 // Calls Clear and frees all associated resources. After calling this method
 // the Subcription instance cannot not be used any more.
+// There is no need to call Close if you are also disposing of the whole
+// Multiplexer, but you will still need to call Stop on it.
 func (s *Subscription) Close() {
 	if s.closed {
 		panic("tried to use a closed subscription")
