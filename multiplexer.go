@@ -33,21 +33,25 @@ type OnReconnectFunc = func()
 type requestType int
 
 const (
-	subscriptionAdd requestType = iota
+	subscriptionInit requestType = iota
+	subscriptionAdd
 	subscriptionRemove
 	subscriptionClose
+	patternInit
+	patternClose
 )
 
 type request struct {
 	reqType requestType
-	ch      string
-	elem    *list.Element
+	name    string
+	node    *list.Element
 }
 
 // A Multiplexer instance corresponds to one Redis Pub/Sub connection that
 // will be shared by multiple Subscription instances.
 // A Multiplexer must be created with New.
 // Multiplexer instances are safe for concurrent use.
+// Multiplexer instances should not be copied.
 type Multiplexer struct {
 	// Options
 	pingTimeout time.Duration
@@ -58,6 +62,7 @@ type Multiplexer struct {
 	createConn       func() (redis.Conn, error)
 	pubsub           redis.PubSubConn
 	channels         map[string]*list.List
+	patterns         map[string]*list.List
 	reqCh            chan request
 	stop             chan struct{}
 	exit             chan struct{}
@@ -85,6 +90,7 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 		pubsub:           redis.PubSubConn{Conn: nil},
 		createConn:       createConn,
 		channels:         make(map[string]*list.List),
+		patterns:         make(map[string]*list.List),
 		reqCh:            make(chan request, 100),
 		stop:             make(chan struct{}),
 		exit:             make(chan struct{}),
@@ -111,13 +117,46 @@ func (mpx *Multiplexer) NewSubscription(
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
 	onReconnect OnReconnectFunc,
-) Subscription {
+) *Subscription {
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
 	}
 	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onReconnect)
-	mpx.subscriptions.AssimilateElement(subscriptionNode)
-	return subscriptionNode.Value.(Subscription)
+	mpx.reqCh <- request{subscriptionInit, "", subscriptionNode}
+	return subscriptionNode.Value.(*Subscription)
+}
+
+// Creates a new PatternSubcription tied to the Multiplexer. Before disposing of a PatternSubcription you
+// must call Close (see the relative Close method for extra advice).
+// Subscription instances are not safe for concurrent use.
+// The arguments onDisconnect and onReconnect can be nil if you're not interested in the
+// corresponding type of events. All event listeners will be called sequentially from
+// a single goroutine. Depending on the workload, consider keeping all functions lean
+// and offload slow operations to other goroutines if necessary.
+// See https://redis.io for more information about the pattern syntax.
+func (mpx *Multiplexer) NewPatternSubscription(
+	pattern string,
+	onMessage OnMessageFunc,
+	onDisconnect OnDisconnectFunc,
+	onReconnect OnReconnectFunc,
+) *PatternSubscription {
+	// TODO: what about empty patterns?
+	if onMessage == nil {
+		panic("onMessage cannot be nil")
+	}
+
+	patternSubNode := createPatternSubscription(mpx, pattern, onMessage, onDisconnect, onReconnect)
+	mpx.reqCh <- request{patternInit, pattern, patternSubNode}
+	return patternSubNode.Value.(*PatternSubscription)
+}
+
+// Creates a new PromiseSubscription. PromiseSubscriptions are safe for concurrent use.
+func (mpx *Multiplexer) NewPromiseSubscription(prefix string) *PromiseSubscription {
+	// TODO: what about empty patterns?
+
+	patternSubNode, promiseSub := createPromiseSubscription(mpx, prefix)
+	mpx.reqCh <- request{patternInit, prefix + "*", patternSubNode}
+	return promiseSub
 }
 
 // Restarts a stopped Multiplexer. Calling Restart on a Multiplexer that was not
@@ -307,7 +346,14 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 	if err != nil {
 		// Notify Subscriptions of the disconnection
 		for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
-			onDisconnect := e.Value.(Subscription).onDisconnect
+
+			var onDisconnect OnDisconnectFunc
+			switch s := e.Value.(type) {
+			case *Subscription:
+				onDisconnect = s.onDisconnect
+			case *PatternSubscription:
+				onDisconnect = s.onDisconnect
+			}
 
 			if onDisconnect != nil {
 				onDisconnect(err)
@@ -327,7 +373,14 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 			// Notify Subscriptions that we reconnected
 			if err != nil {
 				for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
-					onReconnect := e.Value.(Subscription).onReconnect
+
+					var onReconnect OnReconnectFunc
+					switch s := e.Value.(type) {
+					case *Subscription:
+						onReconnect = s.onReconnect
+					case *PatternSubscription:
+						onReconnect = s.onReconnect
+					}
 
 					if onReconnect != nil {
 						onReconnect()
@@ -341,50 +394,90 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 
 func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 	switch req.reqType {
-	case subscriptionClose:
-		mpx.subscriptions.Remove(req.elem)
+	case subscriptionInit:
+		mpx.subscriptions.AssimilateElement(req.node)
 	case subscriptionAdd:
-		listeners, ok := mpx.channels[req.ch]
+		listeners, ok := mpx.channels[req.name]
 
 		if !ok {
 			listeners = list.New()
-			mpx.channels[req.ch] = listeners
+			mpx.channels[req.name] = listeners
 		}
 
 		// Store the listener function
-		listeners.AssimilateElement(req.elem)
+		listeners.AssimilateElement(req.node)
 
 		// Leaving the Networked I/O for last so that failures
 		// don't leave us in an inconsistent state.
 		if !ok {
 			if networkIO {
 				// Subscribe in Redis
-				if err := mpx.pubsub.Subscribe(req.ch); err != nil {
+				if err := mpx.pubsub.Subscribe(req.name); err != nil {
 					return err
 				}
 			}
 		}
 	case subscriptionRemove:
-		listeners, ok := mpx.channels[req.ch]
+		if listeners := req.node.DetachFromList(); listeners != nil {
+			if listeners.Len() > 0 {
+				fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
+			} else {
+				fmt.Printf("[ws] unsubbed also from Redis\n")
+				delete(mpx.channels, req.name)
+				if networkIO {
+					if err := mpx.pubsub.Unsubscribe(req.name); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	case subscriptionClose:
+		mpx.subscriptions.Remove(req.node)
+	case patternInit:
+		// Add node to connection status notifications
+		mpx.subscriptions.AssimilateElement(req.node)
+
+		// Add different node to onMessage notifications
+		onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
+		listeners, ok := mpx.patterns[req.name]
 
 		if !ok {
-			return nil
+			listeners = list.New()
+			mpx.patterns[req.name] = listeners
 		}
 
-		listeners.Remove(req.elem)
+		// Store the listener function
+		listeners.AssimilateElement(onMessageNode)
 
-		if listeners.Len() > 0 {
-			fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
-		} else {
-			fmt.Printf("[ws] unsubbed also from Redis\n")
-			delete(mpx.channels, req.ch)
+		// Leaving the Networked I/O for last so that failures
+		// don't leave us in an inconsistent state.
+		if !ok {
 			if networkIO {
-				if err := mpx.pubsub.Unsubscribe(req.ch); err != nil {
+				// Subscribe in Redis
+				if err := mpx.pubsub.PSubscribe(req.name); err != nil {
 					return err
 				}
 			}
 		}
+	case patternClose:
+		// Unsub from connection state notifications
+		mpx.subscriptions.Remove(req.node)
 
+		// Unsub from messages
+		onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
+		if listeners := onMessageNode.DetachFromList(); listeners != nil {
+			if listeners.Len() > 0 {
+				fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
+			} else {
+				fmt.Printf("[ws] unsubbed also from Redis\n")
+				delete(mpx.patterns, req.name)
+				if networkIO {
+					if err := mpx.pubsub.PUnsubscribe(req.name); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -396,7 +489,16 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		// because they reset the activityTimer and prevent
 		// a reconnection event from happening.
 	case redis.Message:
+		// Channels
 		l, ok := mpx.channels[msg.Channel]
+		if ok {
+			for e := l.Front(); e != nil; e = e.Next() {
+				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)
+			}
+		}
+
+		// Patterns
+		l, ok = mpx.patterns[msg.Pattern]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
 				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)

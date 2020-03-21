@@ -7,6 +7,7 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"time"
 )
 
 var upgrader = websocket.Upgrader{
@@ -36,28 +37,7 @@ func main() {
 			return
 		}
 
-		onMessage := func(ch string, msg []byte) {
-			if err := websocket.WriteJSON(conn, string(msg)); err != nil {
-				log.Println(err)
-				return
-			}
-		}
-
-		onDisconnect := func(_ error) {
-			if err := websocket.WriteJSON(conn, "*Disconnected*"); err != nil {
-				log.Println(err)
-				return
-			}
-		}
-
-		onReconnect := func() {
-			if err := websocket.WriteJSON(conn, "*Reconnected*"); err != nil {
-				log.Println(err)
-				return
-			}
-		}
-
-		sub := multiplexer.NewSubscription(onMessage, onDisconnect, onReconnect)
+		sub := multiplexer.NewPromiseSubscription("p:")
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {
@@ -77,21 +57,21 @@ func main() {
 
 				switch p[0] {
 				case '+':
-					fmt.Printf("[ws] Wants to join [%s]\n", ch)
-					sub.Add(ch)
-				case '-':
-					fmt.Printf("[ws] Wants to leave [%s]\n", ch)
-					sub.Remove(ch)
-				case '!':
-
-				case '?':
-					fmt.Printf("[ws] active subscriptions: {%v}", sub.GetChannels())
-				case 'q':
-					multiplexer.Stop()
-					println("yep the multiplexer was closed")
-				case 'r':
-					multiplexer.Restart()
-					println("running!")
+					promise := sub.NewPromise(ch, 5*time.Second)
+					go func(p *mpx.Promise, ch string) {
+						if ch == "killme" {
+							p.Cancel()
+						}
+						for {
+							msg, ok := <-p.C
+							if ok {
+								fmt.Printf("[promise %v] Received [%v]\n", ch, string(msg))
+							} else {
+								fmt.Printf("[promise %v] Channel closed\n", ch)
+								break
+							}
+						}
+					}(promise, ch)
 				default:
 					continue
 				}

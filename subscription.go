@@ -6,10 +6,11 @@ import (
 	"github.com/RedisMPX/go-mpx/internal/list"
 )
 
-// A Subscription ties a ListenerFunc to zero or more Redis Pub/Sub channels through
+// A Subscription ties a OnMessageFunc to zero or more Redis Pub/Sub channels through
 // a single multiplexed connection. Use NewSubscription from Multiplexer to create a
 // new Subscription. Subscription instances are not safe for concurrent use.
 // Before disposing of a Subscription you must call Close.
+// Subscription instances should not be copied.
 type Subscription struct {
 	mpx             *Multiplexer
 	channels        map[string]*list.Element
@@ -27,7 +28,7 @@ func createSubscription(
 	onReconnect OnReconnectFunc,
 ) *list.Element {
 	node := list.NewElement(nil)
-	node.Value = Subscription{
+	node.Value = &Subscription{
 		mpx,
 		make(map[string]*list.Element),
 		onMessage,

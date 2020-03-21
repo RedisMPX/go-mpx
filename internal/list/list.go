@@ -31,6 +31,28 @@ func (l *List) AssimilateElement(e *Element) *Element {
 	return l.insert(e, l.root.prev)
 }
 
+func (e *Element) Disassemble() {
+	e.list = nil
+	e.prev = nil
+	e.next = nil
+	e.Value = nil
+}
+
+func (e *Element) DetachFromList() *List {
+	if e.list == nil {
+		return nil
+	}
+
+	l := e.list
+	l.len--
+
+	e.prev.next = e.next
+	e.next.prev = e.prev
+
+	e.Disassemble()
+	return l
+}
+
 // END EDITS
 
 // Element is an element of a linked list.
