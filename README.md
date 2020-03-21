@@ -29,21 +29,20 @@ import (
 )
 
 func main() {
-	connBuilder := func() redis.Conn {
-		conn, err := redis.Dial("tcp", ":6379")
-		if err != nil {
-			panic(err)
-		}
-		return conn
+	connBuilder := func() (redis.Conn, error) {
+		return redis.Dial("tcp", ":6379")
 	}
 
 	// Create a Multiplexer
 	multiplexer := mpx.New(connBuilder)
 
-	// Create a Subscription
-	sub := multiplexer.NewSubscription(func(ch string, msg []byte) {
+	// Define a onMessage callback
+	onMessage := func(ch string, msg []byte) {
 		fmt.Printf("channel: [%v] msg: [%v]\n", ch, string(msg))
-	})
+	}
+
+	// Create a Subscription
+	sub := multiplexer.NewSubscription(onMessage, nil, nil)
 
 	// Add a Redis Pub/Sub channel to the Subscription
 	sub.Add("mychannel")
