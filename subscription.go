@@ -12,20 +12,20 @@ import (
 // Before disposing of a Subscription you must call Close.
 // Subscription instances should not be copied.
 type Subscription struct {
-	mpx             *Multiplexer
-	channels        map[string]*list.Element
-	onMessage       OnMessageFunc
-	onDisconnect    OnDisconnectFunc
-	onReconnect     OnReconnectFunc
-	multiplexerNode *list.Element
-	closed          bool
+	mpx              *Multiplexer
+	channels         map[string]*list.Element
+	onMessage        OnMessageFunc
+	onDisconnect     OnDisconnectFunc
+	onActivation     OnActivationFunc
+	onDisconnectNode *list.Element
+	closed           bool
 }
 
 func createSubscription(
 	mpx *Multiplexer,
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
-	onReconnect OnReconnectFunc,
+	onActivation OnActivationFunc,
 ) *list.Element {
 	node := list.NewElement(nil)
 	node.Value = &Subscription{
@@ -33,7 +33,7 @@ func createSubscription(
 		make(map[string]*list.Element),
 		onMessage,
 		onDisconnect,
-		onReconnect,
+		onActivation,
 		node,
 		false,
 	}
@@ -48,7 +48,7 @@ func (s *Subscription) Add(chans ...string) {
 	for _, ch := range chans {
 		_, ok := s.channels[ch]
 		if !ok {
-			node := list.NewElement(s.onMessage)
+			node := list.NewElement(s)
 			s.mpx.reqCh <- request{subscriptionAdd, ch, node}
 			s.channels[ch] = node
 		}
@@ -122,5 +122,5 @@ func (s *Subscription) Close() {
 
 	s.Clear()
 	s.closed = true
-	s.mpx.reqCh <- request{subscriptionClose, "", s.multiplexerNode}
+	s.mpx.reqCh <- request{subscriptionClose, "", s.onDisconnectNode}
 }

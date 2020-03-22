@@ -50,14 +50,14 @@ func main() {
 			}
 		}
 
-		onReconnect := func() {
-			if err := websocket.WriteJSON(conn, "*Reconnected*"); err != nil {
+		onActivation := func(name string) {
+			if err := websocket.WriteJSON(conn, fmt.Sprintf("*Activated: [%v]*", name)); err != nil {
 				log.Println(err)
 				return
 			}
 		}
 
-		sub := multiplexer.NewSubscription(onMessage, onDisconnect, onReconnect)
+		sub := multiplexer.NewSubscription(onMessage, onDisconnect, onActivation)
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {

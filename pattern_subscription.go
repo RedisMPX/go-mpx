@@ -11,14 +11,14 @@ import (
 // PatternSubscription instances should not be copied.
 // For more information about pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
 type PatternSubscription struct {
-	mpx           *Multiplexer
-	pattern       string
-	onMessage     OnMessageFunc
-	onDisconnect  OnDisconnectFunc
-	onReconnect   OnReconnectFunc
-	onNotifNode   *list.Element
-	onMessageNode *list.Element
-	closed        bool
+	mpx              *Multiplexer
+	pattern          string
+	onMessage        OnMessageFunc
+	onDisconnect     OnDisconnectFunc
+	onActivation     OnActivationFunc
+	onDisconnectNode *list.Element
+	onMessageNode    *list.Element
+	closed           bool
 }
 
 func createPatternSubscription(
@@ -26,21 +26,22 @@ func createPatternSubscription(
 	pattern string,
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
-	onReconnect OnReconnectFunc,
+	onActivation OnActivationFunc,
 ) *list.Element {
-	onNotifNode := list.NewElement(nil)
-
-	onNotifNode.Value = &PatternSubscription{
+	onDisconnectNode := list.NewElement(nil)
+	patSub := PatternSubscription{
 		mpx,
 		pattern,
 		onMessage,
 		onDisconnect,
-		onReconnect,
-		onNotifNode,
-		list.NewElement(onMessage),
+		onActivation,
+		onDisconnectNode,
+		nil,
 		false,
 	}
-	return onNotifNode
+	patSub.onMessageNode = list.NewElement(&patSub)
+	onDisconnectNode.Value = &patSub
+	return onDisconnectNode
 }
 
 // Returns the pattern that this PatternSubscription is subscribed to.
@@ -54,5 +55,5 @@ func (p *PatternSubscription) Close() {
 		panic("tried to use a closed PatternSubscription")
 	}
 	p.closed = true
-	p.mpx.reqCh <- request{patternClose, "", p.onNotifNode}
+	p.mpx.reqCh <- request{patternClose, "", p.onDisconnectNode}
 }

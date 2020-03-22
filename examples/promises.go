@@ -38,6 +38,8 @@ func main() {
 		}
 
 		sub := multiplexer.NewPromiseSubscription("p:")
+		sub.WaitForActivation()
+		println("sub is active!")
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {
@@ -56,8 +58,30 @@ func main() {
 				ch := string(p[1:])
 
 				switch p[0] {
+				case '*':
+					promise := sub.WaitForNewPromise(ch, 5*time.Second)
+					println("OK")
+					go func(p *mpx.Promise, ch string) {
+						if ch == "killme" {
+							p.Cancel()
+						}
+						for {
+							msg, ok := <-p.C
+							if ok {
+								fmt.Printf("[promise %v] Received [%v]\n", ch, string(msg))
+							} else {
+								fmt.Printf("[promise %v] Channel closed\n", ch)
+								break
+							}
+						}
+					}(promise, ch)
 				case '+':
-					promise := sub.NewPromise(ch, 5*time.Second)
+					promise, err := sub.NewPromise(ch, 5*time.Second)
+					println("OK")
+					if err != nil {
+						println("failed to create the promise: we are disconnected")
+						continue
+					}
 					go func(p *mpx.Promise, ch string) {
 						if ch == "killme" {
 							p.Cancel()

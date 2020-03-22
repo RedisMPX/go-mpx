@@ -14,21 +14,20 @@ import (
 
 var errPingTimeout = errors.New("redis: ping timeout")
 
-// A function that Subscriber will trigger every time a new message
-// is recevied on a Redis Pub/Sub channel that was added to it.
+// A function that gets triggered whenever a message is received on
+// a given Redis Pub/Sub channel.
 type OnMessageFunc = func(channel string, message []byte)
 
-// A function that Subscriber will trigger every time the Redis Pub/Sub
+// A function that gets triggered every time the Redis Pub/Sub
 // connection has been lost. The error argument will be the error that
-// triggered the reconnection event.
-// Subscriber ensures that this function will be triggered *after* all
-// pending messages have been dispatched.
+// caused the reconnection event.
+// This function will be triggered *after* all pending messages have been dispatched.
 type OnDisconnectFunc = func(error)
 
-// A function that Subscriber will trigger once a connection has been
-// re-established. Subscriber ensures that this function will be triggered
-// *before* new messages start coming from the new connection.
-type OnReconnectFunc = func()
+// A function that gets triggered whenever a subscription goes into effect.
+//  - Subscription: name is a Redis Pub/Sub channel
+//  - PatternSubscription: name is a Redis Pub/Sub pattern
+type OnActivationFunc = func(name string)
 
 type requestType int
 
@@ -84,7 +83,7 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	size := 1000
 
 	mpx := Multiplexer{
-		pingTimeout:      5 * time.Second,
+		pingTimeout:      30 * time.Second,
 		minBackOff:       8 * time.Millisecond,
 		maxBackOff:       512 * time.Millisecond,
 		pubsub:           redis.PubSubConn{Conn: nil},
@@ -116,12 +115,12 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 func (mpx *Multiplexer) NewSubscription(
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
-	onReconnect OnReconnectFunc,
+	onActivation OnActivationFunc,
 ) *Subscription {
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
 	}
-	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onReconnect)
+	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onActivation)
 	mpx.reqCh <- request{subscriptionInit, "", subscriptionNode}
 	return subscriptionNode.Value.(*Subscription)
 }
@@ -138,24 +137,26 @@ func (mpx *Multiplexer) NewPatternSubscription(
 	pattern string,
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
-	onReconnect OnReconnectFunc,
+	onActivation OnActivationFunc,
 ) *PatternSubscription {
 	// TODO: what about empty patterns?
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
 	}
 
-	patternSubNode := createPatternSubscription(mpx, pattern, onMessage, onDisconnect, onReconnect)
+	patternSubNode := createPatternSubscription(mpx, pattern, onMessage, onDisconnect, onActivation)
 	mpx.reqCh <- request{patternInit, pattern, patternSubNode}
 	return patternSubNode.Value.(*PatternSubscription)
 }
 
 // Creates a new PromiseSubscription. PromiseSubscriptions are safe for concurrent use.
+// The prefix argument is used to create a PatternSubscription that will match all
+// channels that start with the provided prefix.
 func (mpx *Multiplexer) NewPromiseSubscription(prefix string) *PromiseSubscription {
 	// TODO: what about empty patterns?
 
 	patternSubNode, promiseSub := createPromiseSubscription(mpx, prefix)
-	mpx.reqCh <- request{patternInit, prefix + "*", patternSubNode}
+	mpx.reqCh <- request{patternInit, promiseSub.patSub.pattern, patternSubNode}
 	return promiseSub
 }
 
@@ -297,19 +298,39 @@ func (mpx *Multiplexer) connectionGoroutine() {
 		}
 
 		// Gather all Redis Pub/Sub channel names in a slice
-		chList := make([]interface{}, len(mpx.channels))
+		{
+			chList := make([]interface{}, len(mpx.channels))
 
-		var idx int
-		for ch := range mpx.channels {
-			chList[idx] = ch
-			idx += 1
+			var idx int
+			for ch := range mpx.channels {
+				chList[idx] = ch
+				idx += 1
+			}
+
+			// Resubscribe to all the Redis Pub/Sub channels
+			if len(chList) > 0 {
+				mpx.pubsub.Subscribe(chList...)
+			}
+
 		}
 
-		// Resubscribe to all the Redis Pub/Sub channels
-		if len(chList) > 0 {
-			mpx.pubsub.Subscribe(chList...)
-		}
+		// Gather all Redis Pub/Sub patterns in a slice
+		{
+			// TODO: can this be optimized, like reuse that was allocated before?
+			patList := make([]interface{}, len(mpx.patterns))
 
+			var idx int
+			for ch := range mpx.patterns {
+				patList[idx] = ch
+				idx += 1
+			}
+
+			// Resubscribe to all the Redis Pub/Sub channels
+			if len(patList) > 0 {
+				mpx.pubsub.PSubscribe(patList...)
+			}
+
+		}
 		// Restart the goroutines
 		mpx.stopWG.Add(1)
 		go mpx.requestProcessingGoroutine()
@@ -370,23 +391,6 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 		case req := <-mpx.reqCh:
 			mpx.processRequest(req, false)
 		case <-mpx.exit:
-			// Notify Subscriptions that we reconnected
-			if err != nil {
-				for e := mpx.subscriptions.Front(); e != nil; e = e.Next() {
-
-					var onReconnect OnReconnectFunc
-					switch s := e.Value.(type) {
-					case *Subscription:
-						onReconnect = s.onReconnect
-					case *PatternSubscription:
-						onReconnect = s.onReconnect
-					}
-
-					if onReconnect != nil {
-						onReconnect()
-					}
-				}
-			}
 			return
 		}
 	}
@@ -414,6 +418,19 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 				// Subscribe in Redis
 				if err := mpx.pubsub.Subscribe(req.name); err != nil {
 					return err
+				}
+			}
+		} else {
+			// We were already subscribed to that channel
+			if networkIO {
+				// If we are not in offline-mode, we immediately send confirmation
+				// that the subscription is active. If we are in the case where
+				// we just lost connectivity and processRequestGoroutine has not yet
+				// noticed, we will send a wrong notification, but we will also soon
+				// send a onDisconnect notification, after this goroutine exits, thus
+				// rectifying our wrong communication.
+				if onActivation := req.node.Value.(*Subscription).onActivation; onActivation != nil {
+					onActivation(req.name)
 				}
 			}
 		}
@@ -458,6 +475,19 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 					return err
 				}
 			}
+		} else {
+			// We were already subscribed to that channel
+			if networkIO {
+				// If we are not in offline-mode, we immediately send confirmation
+				// that the subscription is active. If we are in the case where
+				// we just lost connectivity and processRequestGoroutine has not yet
+				// noticed, we will send a wrong notification, but we will also soon
+				// send a onDisconnect notification, after this goroutine exits, thus
+				// rectifying our wrong communication.
+				if onActivation := req.node.Value.(*PatternSubscription).onActivation; onActivation != nil {
+					onActivation(req.name)
+				}
+			}
 		}
 	case patternClose:
 		// Unsub from connection state notifications
@@ -493,7 +523,7 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		l, ok := mpx.channels[msg.Channel]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
-				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)
+				e.Value.(*Subscription).onMessage(msg.Channel, msg.Data)
 			}
 		}
 
@@ -501,16 +531,32 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		l, ok = mpx.patterns[msg.Pattern]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
-				e.Value.(OnMessageFunc)(msg.Channel, msg.Data)
+				e.Value.(*PatternSubscription).onMessage(msg.Channel, msg.Data)
 			}
 		}
 	case redis.Subscription:
-		// l, ok := mpx.listeners[msg.Channel]
-		// if ok {
-		// 	for e := l.Front(); e != nil; e = e.Next() {
-		// 		e.Value(msg.Channel, msg.Data)
-		// 	}
-		// }
+		switch msg.Kind {
+		case "subscribe":
+			// Channels
+			l, ok := mpx.channels[msg.Channel]
+			if ok {
+				for e := l.Front(); e != nil; e = e.Next() {
+					if onActivation := e.Value.(*Subscription).onActivation; onActivation != nil {
+						onActivation(msg.Channel)
+					}
+				}
+			}
+		case "psubscribe":
+			// Patterns
+			l, ok := mpx.patterns[msg.Channel]
+			if ok {
+				for e := l.Front(); e != nil; e = e.Next() {
+					if onActivation := e.Value.(*PatternSubscription).onActivation; onActivation != nil {
+						onActivation(msg.Channel)
+					}
+				}
+			}
+		}
 	}
 }
 
