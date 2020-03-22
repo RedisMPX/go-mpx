@@ -81,10 +81,7 @@ type Multiplexer struct {
 // to Redis at a time. Multiplexers will automatically try to reconnect using
 // an exponential backoff (plus jitter) algorithm.
 func New(createConn func() (redis.Conn, error)) *Multiplexer {
-	// TODO: how do we notify the user that we can't make a connection immediately?
-
 	size := 1000
-
 	mpx := Multiplexer{
 		pingTimeout:      30 * time.Second,
 		minBackOff:       8 * time.Millisecond,
