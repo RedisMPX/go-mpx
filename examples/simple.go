@@ -21,7 +21,7 @@ func main() {
 	}
 
 	// Create a Subscription
-	sub := multiplexer.NewSubscription(onMessage, nil, nil)
+	sub := multiplexer.NewChannelSubscription(onMessage, nil, nil)
 
 	// Add a Redis Pub/Sub channel to the Subscription
 	sub.Add("mychannel")
