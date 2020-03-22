@@ -14,7 +14,7 @@ Main functionality completed, needs testing.
 ## Features
 - Simple channel subscriptions
 - Pattern subscriptions
-- [Networked promise system](https://godoc.org/github.com/RedisMPX/go-mpx#Promise)
+- **[Networked promise system](https://godoc.org/github.com/RedisMPX/go-mpx#Promise)**
 - Connection retry with exponetial backoff + jitter
 - Aggressive pipelining over the Redis Pub/Sub connection
 
