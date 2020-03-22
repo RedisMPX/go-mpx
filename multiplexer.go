@@ -1,4 +1,8 @@
 // Package mpx implements a Redis Pub/Sub multiplexer.
+//
+// Important
+//
+// All main types implemented by this package must not be copied.
 package mpx
 
 import (
@@ -104,13 +108,13 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 	return &mpx
 }
 
-// Creates a new Subscription tied to the Multiplexer. Before disposing of a Subcription you
-// must call Close (see the relative Close method for extra advice).
-// Subscription instances are not safe for concurrent use.
-// The arguments onDisconnect and onReconnect can be nil if you're not interested in the
-// corresponding type of events. All event listeners will be called sequentially from
+// Creates a new ChannelSubscription tied to the Multiplexer.
+// Before disposing of a ChannelSubscription you must call its Close method.
+// The arguments onDisconnect and onActivation can be nil if you're not interested in the
+// corresponding types of event. All event listeners will be called sequentially from
 // a single goroutine. Depending on the workload, consider keeping all functions lean
-// and offload slow operations to other goroutines if necessary.
+// and offload slow operations to other goroutines whenever possible.
+// ChannelSubscription instances are not safe for concurrent use.
 func (mpx *Multiplexer) NewChannelSubscription(
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
@@ -119,7 +123,7 @@ func (mpx *Multiplexer) NewChannelSubscription(
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
 	}
-	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onActivation)
+	subscriptionNode := createChannelSubscription(mpx, onMessage, onDisconnect, onActivation)
 	mpx.reqCh <- request{subscriptionInit, "", subscriptionNode}
 	return subscriptionNode.Value.(*ChannelSubscription)
 }
@@ -131,6 +135,7 @@ func (mpx *Multiplexer) NewChannelSubscription(
 // a single goroutine. Depending on the workload, consider keeping all functions lean
 // and offload slow operations to other goroutines whenever possible.
 // PatternSubscription instances are not safe for concurrent use.
+//
 // For more information about pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
 func (mpx *Multiplexer) NewPatternSubscription(
 	pattern string,
@@ -175,9 +180,6 @@ func (mpx *Multiplexer) Restart() {
 }
 
 // Stops all service goroutines and closes the underlying Redis Pub/Sub connection.
-// The Multiplexer will still be tied to the Subscriptions created from it, so
-// it's the callers duty to avoid calling Add / Remove / Clear from those Subscriptions
-// while the Multiplexer is stopped. Stopped Multiplexers can be restarted (see Restart).
 func (mpx *Multiplexer) Stop() {
 	select {
 	case <-mpx.stop:

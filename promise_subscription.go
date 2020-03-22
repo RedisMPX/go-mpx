@@ -73,7 +73,7 @@ type Promise struct {
 }
 
 // Cancels a Promise. Calling Cancel more than once,
-// or on an already-fullfilled Promise is a noop.
+// or on an already-fullfilled Promise, is a no-op.
 func (p *Promise) Cancel() {
 	// TODO make done an atomic check before grabbing the lock
 	// sync.Once doesn't seem to fit the bill because it forces
