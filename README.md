@@ -9,9 +9,14 @@ RedisMPX is a Redis Pub/Sub multiplexer written in multiple languages and liveco
 
 
 ## Status
-This library is currently in Alpha, still main features missing. Don't use in production.
+Main functionality completed, needs testing.
 
-
+## Features
+- Simple channel subscriptions
+- Pattern subscriptions
+- Networked promise system
+- Connection retry with exponetial backoff + jitter
+- Aggressive pipelining over the Redis Pub/Sub connection
 
 ## Documentation
 - [API Reference](https://godoc.org/github.com/RedisMPX/go-mpx)
