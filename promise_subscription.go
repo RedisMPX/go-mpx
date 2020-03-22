@@ -116,7 +116,7 @@ func (p *PromiseSubscription) WaitForActivation() (ok bool) {
 	}
 
 	p.activationCond.Wait()
-	ok = p.closed
+	return p.closed
 }
 
 // Like NewPromise, but it will wait for the PromiseSubscription to become
@@ -135,12 +135,16 @@ func (p *PromiseSubscription) WaitForNewPromise(suffix string, timeout time.Dura
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
+		if p.closed {
+			return nil, false
+		}
+
 		res, err := p.locklessNewPromise(suffix, timeout)
 		if err == nil {
-			return res
+			return res, true
 		}
+
 		p.activationCond.Wait()
-		return p.closed
 	}
 }
 
@@ -154,13 +158,14 @@ func (p *PromiseSubscription) WaitForNewPromise(suffix string, timeout time.Dura
 func (p *PromiseSubscription) NewPromise(suffix string, timeout time.Duration) (*Promise, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.closed {
+		panic("tried to use a alread closed PromiseSubscription")
+	}
 	return p.locklessNewPromise(suffix, timeout)
 }
 
 func (p *PromiseSubscription) locklessNewPromise(suffix string, timeout time.Duration) (*Promise, error) {
-	if p.closed {
-		panic("tried to use a alread closed PromiseSubscription")
-	}
 	if !p.isPatSubActive {
 		return nil, InactiveSubscriptionError
 	}

@@ -59,7 +59,7 @@ func main() {
 
 				switch p[0] {
 				case '*':
-					promise := sub.WaitForNewPromise(ch, 5*time.Second)
+					promise, _ := sub.WaitForNewPromise(ch, 5*time.Second)
 					println("OK")
 					go func(p *mpx.Promise, ch string) {
 						if ch == "killme" {

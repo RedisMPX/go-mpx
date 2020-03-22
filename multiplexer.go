@@ -47,10 +47,9 @@ type request struct {
 }
 
 // A Multiplexer instance corresponds to one Redis Pub/Sub connection that
-// will be shared by multiple Subscription instances.
+// will be shared by multiple subscription instances.
 // A Multiplexer must be created with New.
 // Multiplexer instances are safe for concurrent use.
-// Multiplexer instances should not be copied.
 type Multiplexer struct {
 	// Options
 	pingTimeout time.Duration
@@ -112,27 +111,27 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 // corresponding type of events. All event listeners will be called sequentially from
 // a single goroutine. Depending on the workload, consider keeping all functions lean
 // and offload slow operations to other goroutines if necessary.
-func (mpx *Multiplexer) NewSubscription(
+func (mpx *Multiplexer) NewChannelSubscription(
 	onMessage OnMessageFunc,
 	onDisconnect OnDisconnectFunc,
 	onActivation OnActivationFunc,
-) *Subscription {
+) *ChannelSubscription {
 	if onMessage == nil {
 		panic("onMessage cannot be nil")
 	}
 	subscriptionNode := createSubscription(mpx, onMessage, onDisconnect, onActivation)
 	mpx.reqCh <- request{subscriptionInit, "", subscriptionNode}
-	return subscriptionNode.Value.(*Subscription)
+	return subscriptionNode.Value.(*ChannelSubscription)
 }
 
 // Creates a new PatternSubcription tied to the Multiplexer. Before disposing of a PatternSubcription you
-// must call Close (see the relative Close method for extra advice).
-// Subscription instances are not safe for concurrent use.
-// The arguments onDisconnect and onReconnect can be nil if you're not interested in the
-// corresponding type of events. All event listeners will be called sequentially from
+// must call its Close method.
+// The arguments onDisconnect and onActivation can be nil if you're not interested in the
+// corresponding types of event. All event listeners will be called sequentially from
 // a single goroutine. Depending on the workload, consider keeping all functions lean
-// and offload slow operations to other goroutines if necessary.
-// See https://redis.io for more information about the pattern syntax.
+// and offload slow operations to other goroutines whenever possible.
+// PatternSubscription instances are not safe for concurrent use.
+// For more information about pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
 func (mpx *Multiplexer) NewPatternSubscription(
 	pattern string,
 	onMessage OnMessageFunc,
@@ -370,7 +369,7 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 
 			var onDisconnect OnDisconnectFunc
 			switch s := e.Value.(type) {
-			case *Subscription:
+			case *ChannelSubscription:
 				onDisconnect = s.onDisconnect
 			case *PatternSubscription:
 				onDisconnect = s.onDisconnect
@@ -429,7 +428,7 @@ func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
 				// noticed, we will send a wrong notification, but we will also soon
 				// send a onDisconnect notification, after this goroutine exits, thus
 				// rectifying our wrong communication.
-				if onActivation := req.node.Value.(*Subscription).onActivation; onActivation != nil {
+				if onActivation := req.node.Value.(*ChannelSubscription).onActivation; onActivation != nil {
 					onActivation(req.name)
 				}
 			}
@@ -523,7 +522,7 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 		l, ok := mpx.channels[msg.Channel]
 		if ok {
 			for e := l.Front(); e != nil; e = e.Next() {
-				e.Value.(*Subscription).onMessage(msg.Channel, msg.Data)
+				e.Value.(*ChannelSubscription).onMessage(msg.Channel, msg.Data)
 			}
 		}
 
@@ -541,7 +540,7 @@ func (mpx *Multiplexer) dispatchMessage(msgInterface interface{}) {
 			l, ok := mpx.channels[msg.Channel]
 			if ok {
 				for e := l.Front(); e != nil; e = e.Next() {
-					if onActivation := e.Value.(*Subscription).onActivation; onActivation != nil {
+					if onActivation := e.Value.(*ChannelSubscription).onActivation; onActivation != nil {
 						onActivation(msg.Channel)
 					}
 				}
