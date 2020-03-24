@@ -8,8 +8,9 @@ RedisMPX is a Redis Pub/Sub multiplexer written in multiple languages and liveco
 - [YouTube VOD archive](https://www.youtube.com/user/Kappaloris/videos)
 
 ## Status
-Main functionality completed, needs testing. In the future I'll write a fuzzer to 
-test for all the possible concurrency combinations.
+Main functionality completed. No unit tests have been written as the real
+source of complexity is how goroutines and concurrency mix with network I/O etc.
+So instead of wasting effort mostly useless unit tests, I aim to write a fuzzer for that purpose.
 
 ## Features
 - Simple channel subscriptions
