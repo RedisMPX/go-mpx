@@ -7,10 +7,10 @@ import (
 // A PatternSubscription ties a OnMessageFunc to one Redis Pub/Sub pattern through
 // a single multiplexed connection. Use NewPatternSubscription from Multiplexer to create a
 // new PatternSubscription.
-// Before disposing of a PatternSubscription you must call Close.
+// Before disposing of a PatternSubscription you must call Close on it.
 // PatternSubscription instances are not safe for concurrent use.
 //
-// For more information about pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
+// For more information about the pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
 type PatternSubscription struct {
 	mpx              *Multiplexer
 	pattern          string

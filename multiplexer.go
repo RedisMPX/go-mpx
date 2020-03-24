@@ -56,9 +56,10 @@ type request struct {
 // Multiplexer instances are safe for concurrent use.
 type Multiplexer struct {
 	// Options
-	pingTimeout time.Duration
-	minBackOff  time.Duration
-	maxBackOff  time.Duration
+	pingTimeout     time.Duration
+	minBackOff      time.Duration
+	maxBackOff      time.Duration
+	pipeliningSlots []request
 
 	// state
 	createConn       func() (redis.Conn, error)
@@ -80,12 +81,35 @@ type Multiplexer struct {
 // in case of errors, meaning that a Multiplexer will only have one active connection
 // to Redis at a time. Multiplexers will automatically try to reconnect using
 // an exponential backoff (plus jitter) algorithm.
+// It also provides a few default options. Look at the source code to see the defaults.
 func New(createConn func() (redis.Conn, error)) *Multiplexer {
-	size := 1000
+	return NewWithOpts(createConn,
+		30*time.Second,       // pingTimeout
+		8*time.Millisecond,   // minBackoff
+		512*time.Millisecond, // maxBackoff
+		1000,                 // messagesBufSize
+		20,                   // pipeliningBufSize
+	)
+}
+
+// Like new, but allows customizing a few options.
+//  - pingTimeout:       time of inactivity before we trigger a PING request
+//  - min/maxBackoff:    parameter for exponential backoff during reconnection events
+//  - messagesBufSize:   buffer size for internal Pub/Sub messages channel
+//  - pipeliningBufSize: buffer size for pipelining Pub/Sub commands
+func NewWithOpts(
+	createConn func() (redis.Conn, error),
+	pingTimeout time.Duration,
+	minBackOff time.Duration,
+	maxBackOff time.Duration,
+	messagesBufSize uint,
+	pipeliningBufSize uint,
+) *Multiplexer {
 	mpx := Multiplexer{
-		pingTimeout:      30 * time.Second,
-		minBackOff:       8 * time.Millisecond,
-		maxBackOff:       512 * time.Millisecond,
+		pingTimeout:      pingTimeout,
+		minBackoff:       minBackOff,
+		maxBackoff:       maxBackoff,
+		pipeliningSlots:  make([]request, pipeliningBufSize),
 		pubsub:           redis.PubSubConn{Conn: nil},
 		createConn:       createConn,
 		channels:         make(map[string]*list.List),
@@ -95,7 +119,7 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 		exit:             make(chan struct{}),
 		stopWG:           sync.WaitGroup{},
 		readerGoroExitWG: sync.WaitGroup{},
-		messages:         make(chan interface{}, size),
+		messages:         make(chan interface{}, messagesBufSize),
 		mustReconnectCh:  make(chan error),
 		subscriptions:    list.New(),
 	}
@@ -133,7 +157,7 @@ func (mpx *Multiplexer) NewChannelSubscription(
 // and offload slow operations to other goroutines whenever possible.
 // PatternSubscription instances are not safe for concurrent use.
 //
-// For more information about pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
+// For more information about the pattern syntax: https://redis.io/topics/pubsub#pattern-matching-subscriptions
 func (mpx *Multiplexer) NewPatternSubscription(
 	pattern string,
 	onMessage OnMessageFunc,
@@ -386,127 +410,167 @@ func (mpx *Multiplexer) offlineProcessingGoroutine(err error) {
 		select {
 		case <-mpx.stop:
 			return
-		case req := <-mpx.reqCh:
-			mpx.processRequest(req, false)
+		case mpx.pipeliningSlots[0] = <-mpx.reqCh:
+			// Let's try to grab more requests out of the channel,
+			// up to maxPipeliningSlots.
+			var i int = 1
+		innerLoop:
+			for i < len(mpx.pipeliningSlots) {
+				select {
+				case mpx.pipeliningSlots[i] = <-mpx.reqCh:
+					i += 1
+				default:
+					break innerLoop
+				}
+			}
+			mpx.processRequests(mpx.pipeliningSlots[:i], false)
 		case <-mpx.exit:
 			return
 		}
 	}
 }
 
-func (mpx *Multiplexer) processRequest(req request, networkIO bool) error {
-	switch req.reqType {
-	case subscriptionInit:
-		mpx.subscriptions.AssimilateElement(req.node)
-	case subscriptionAdd:
-		listeners, ok := mpx.channels[req.name]
+func (mpx *Multiplexer) processRequests(requests []request, networkIO bool) error {
+	// TODO: improve this by avoiding unnecessary allocations.
+	// if you have a single slice long len(mpx.pipeliningSlots),
+	// you can strategize about where you put the items to pluck
+	// 4 slices for all 4 types of requests (sub, unsub, psub, punsub).
+	var sub, unsub, psub, punsub []interface{}
+	for _, req := range requests {
+		switch req.reqType {
+		case subscriptionInit:
+			mpx.subscriptions.AssimilateElement(req.node)
+		case subscriptionAdd:
+			listeners, ok := mpx.channels[req.name]
 
-		if !ok {
-			listeners = list.New()
-			mpx.channels[req.name] = listeners
-		}
-
-		// Store the listener function
-		listeners.AssimilateElement(req.node)
-
-		// Leaving the Networked I/O for last so that failures
-		// don't leave us in an inconsistent state.
-		if !ok {
-			if networkIO {
-				// Subscribe in Redis
-				if err := mpx.pubsub.Subscribe(req.name); err != nil {
-					return err
-				}
+			if !ok {
+				listeners = list.New()
+				mpx.channels[req.name] = listeners
 			}
-		} else {
-			// We were already subscribed to that channel
-			if networkIO {
-				// If we are not in offline-mode, we immediately send confirmation
-				// that the subscription is active. If we are in the case where
-				// we just lost connectivity and processRequestGoroutine has not yet
-				// noticed, we will send a wrong notification, but we will also soon
-				// send a onDisconnect notification, after this goroutine exits, thus
-				// rectifying our wrong communication.
-				if onActivation := req.node.Value.(*ChannelSubscription).onActivation; onActivation != nil {
-					onActivation(req.name)
-				}
-			}
-		}
-	case subscriptionRemove:
-		if listeners := req.node.DetachFromList(); listeners != nil {
-			if listeners.Len() > 0 {
-				fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
-			} else {
-				fmt.Printf("[ws] unsubbed also from Redis\n")
-				delete(mpx.channels, req.name)
+
+			// Store the listener function
+			listeners.AssimilateElement(req.node)
+
+			// Leaving the Networked I/O for last so that failures
+			// don't leave us in an inconsistent state.
+			if !ok {
 				if networkIO {
-					if err := mpx.pubsub.Unsubscribe(req.name); err != nil {
-						return err
+					// Subscribe in Redis
+					sub = append(sub, req.name)
+				}
+			} else {
+				// We were already subscribed to that channel
+				if networkIO {
+					// If we are not in offline-mode, we immediately send confirmation
+					// that the subscription is active. If we are in the case where
+					// we just lost connectivity and processRequestGoroutine has not yet
+					// noticed, we will send a wrong notification, but we will also soon
+					// send a onDisconnect notification, after this goroutine exits, thus
+					// rectifying our wrong communication.
+					if onActivation := req.node.Value.(*ChannelSubscription).onActivation; onActivation != nil {
+						onActivation(req.name)
 					}
 				}
 			}
-		}
-	case subscriptionClose:
-		mpx.subscriptions.Remove(req.node)
-	case patternInit:
-		// Add node to connection status notifications
-		mpx.subscriptions.AssimilateElement(req.node)
-
-		// Add different node to onMessage notifications
-		onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
-		listeners, ok := mpx.patterns[req.name]
-
-		if !ok {
-			listeners = list.New()
-			mpx.patterns[req.name] = listeners
-		}
-
-		// Store the listener function
-		listeners.AssimilateElement(onMessageNode)
-
-		// Leaving the Networked I/O for last so that failures
-		// don't leave us in an inconsistent state.
-		if !ok {
-			if networkIO {
-				// Subscribe in Redis
-				if err := mpx.pubsub.PSubscribe(req.name); err != nil {
-					return err
+		case subscriptionRemove:
+			if listeners := req.node.DetachFromList(); listeners != nil {
+				if listeners.Len() > 0 {
+					fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
+				} else {
+					fmt.Printf("[ws] unsubbed also from Redis\n")
+					delete(mpx.channels, req.name)
+					if networkIO {
+						unsub = append(unsub, req.name)
+					}
 				}
 			}
-		} else {
-			// We were already subscribed to that channel
-			if networkIO {
-				// If we are not in offline-mode, we immediately send confirmation
-				// that the subscription is active. If we are in the case where
-				// we just lost connectivity and processRequestGoroutine has not yet
-				// noticed, we will send a wrong notification, but we will also soon
-				// send a onDisconnect notification, after this goroutine exits, thus
-				// rectifying our wrong communication.
-				if onActivation := req.node.Value.(*PatternSubscription).onActivation; onActivation != nil {
-					onActivation(req.name)
-				}
-			}
-		}
-	case patternClose:
-		// Unsub from connection state notifications
-		mpx.subscriptions.Remove(req.node)
+		case subscriptionClose:
+			mpx.subscriptions.Remove(req.node)
+		case patternInit:
+			// Add node to connection status notifications
+			mpx.subscriptions.AssimilateElement(req.node)
 
-		// Unsub from messages
-		onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
-		if listeners := onMessageNode.DetachFromList(); listeners != nil {
-			if listeners.Len() > 0 {
-				fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
-			} else {
-				fmt.Printf("[ws] unsubbed also from Redis\n")
-				delete(mpx.patterns, req.name)
+			// Add different node to onMessage notifications
+			onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
+			listeners, ok := mpx.patterns[req.name]
+
+			if !ok {
+				listeners = list.New()
+				mpx.patterns[req.name] = listeners
+			}
+
+			// Store the listener function
+			listeners.AssimilateElement(onMessageNode)
+
+			// Leaving the Networked I/O for last so that failures
+			// don't leave us in an inconsistent state.
+			if !ok {
 				if networkIO {
-					if err := mpx.pubsub.PUnsubscribe(req.name); err != nil {
-						return err
+					// PSubscribe in Redis
+					psub = append(psub, req.name)
+				}
+			} else {
+				// We were already subscribed to that channel
+				if networkIO {
+					// If we are not in offline-mode, we immediately send confirmation
+					// that the subscription is active. If we are in the case where
+					// we just lost connectivity and processRequestGoroutine has not yet
+					// noticed, we will send a wrong notification, but we will also soon
+					// send a onDisconnect notification, after this goroutine exits, thus
+					// rectifying our wrong communication.
+					if onActivation := req.node.Value.(*PatternSubscription).onActivation; onActivation != nil {
+						onActivation(req.name)
+					}
+				}
+			}
+		case patternClose:
+			// Unsub from connection state notifications
+			mpx.subscriptions.Remove(req.node)
+
+			// Unsub from messages
+			onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
+			if listeners := onMessageNode.DetachFromList(); listeners != nil {
+				if listeners.Len() > 0 {
+					fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
+				} else {
+					fmt.Printf("[ws] unsubbed also from Redis\n")
+					delete(mpx.patterns, req.name)
+					if networkIO {
+						punsub = append(punsub, req.name)
 					}
 				}
 			}
 		}
 	}
+
+	// We're now going to write all commands of the same type as a single
+	// invocation (e.g. SUBSCRIBE foo bar baz instead of 3 separate commands),
+	// and we're also going to flush the buffer only once at the end.
+	// This is pretty good pipelining.
+	if networkIO {
+		if len(sub) > 0 {
+			if err := mpx.pubsub.Conn.Send("SUBSCRIBE", sub...); err != nil {
+				return err
+			}
+		}
+		if len(unsub) > 0 {
+			if err := mpx.pubsub.Conn.Send("UNSUBSCRIBE", unsub...); err != nil {
+				return err
+			}
+		}
+		if len(psub) > 0 {
+			if err := mpx.pubsub.Conn.Send("PSUBSCRIBE", psub...); err != nil {
+				return err
+			}
+		}
+		if len(punsub) > 0 {
+			if err := mpx.pubsub.Conn.Send("PUNSUBSCRIBE", punsub...); err != nil {
+				return err
+			}
+		}
+		return mpx.pubsub.Conn.Flush()
+	}
+
 	return nil
 }
 
@@ -567,8 +631,20 @@ func (mpx *Multiplexer) requestProcessingGoroutine() {
 
 	for {
 		select {
-		case req := <-mpx.reqCh:
-			if err := mpx.processRequest(req, true); err != nil {
+		case mpx.pipeliningSlots[0] = <-mpx.reqCh:
+			// Let's try to grab more requests out of the channel,
+			// up to maxPipeliningSlots.
+			var i int = 1
+		innerLoop:
+			for i < len(mpx.pipeliningSlots) {
+				select {
+				case mpx.pipeliningSlots[i] = <-mpx.reqCh:
+					i += 1
+				default:
+					break innerLoop
+				}
+			}
+			if err := mpx.processRequests(mpx.pipeliningSlots[:i], true); err != nil {
 				mpx.triggerReconnect(err)
 				return
 			}

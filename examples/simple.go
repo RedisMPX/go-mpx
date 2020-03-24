@@ -34,11 +34,11 @@ func main() {
 
 	// Publish Messages over Redis Pub/Sub forever.
 	for {
+		time.Sleep(2 * time.Second)
 		_, err := conn.Do("PUBLISH", "mychannel", "Hello World!")
 		if err != nil {
 			panic(err)
 		}
 
-		time.Sleep(3 * time.Second)
 	}
 }

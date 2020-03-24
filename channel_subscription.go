@@ -9,11 +9,16 @@ import (
 // A ChannelSubscription ties a OnMessageFunc to zero or more Redis Pub/Sub channels through
 // a single multiplexed connection. Use NewChannelSubscription from Multiplexer to create a
 // new ChannelSubscription.
-// Before disposing of a ChannelSubscription you must call Close.
+// Before disposing of a ChannelSubscription you must call Close on it.
+//
 // ChannelSubscription instances are not safe for concurrent use.
 type ChannelSubscription struct {
+	// Map that contains the Redis Pub/Sub channels
+	// added to the subscription. Useful for testing
+	// membership and obtaining a list of names.
+	// Do not modify directly.
+	Channels         map[string]*list.Element
 	mpx              *Multiplexer
-	channels         map[string]*list.Element
 	onMessage        OnMessageFunc
 	onDisconnect     OnDisconnectFunc
 	onActivation     OnActivationFunc
@@ -29,8 +34,8 @@ func createChannelSubscription(
 ) *list.Element {
 	node := list.NewElement(nil)
 	node.Value = &ChannelSubscription{
-		mpx,
 		make(map[string]*list.Element),
+		mpx,
 		onMessage,
 		onDisconnect,
 		onActivation,
@@ -41,11 +46,11 @@ func createChannelSubscription(
 }
 
 // Adds a new Redis Pub/Sub channel to the ChannelSubscription.
-func (s *ChannelSubscription) Add(chans ...string) {
+func (s *ChannelSubscription) Add(channels ...string) {
 	if s.closed {
 		panic("tried to use a closed subscription")
 	}
-	for _, ch := range chans {
+	for _, ch := range channels {
 		_, ok := s.channels[ch]
 		if !ok {
 			node := list.NewElement(s)
@@ -58,44 +63,17 @@ func (s *ChannelSubscription) Add(chans ...string) {
 // TODO: have remove return something to notify the user that the request failed?
 
 // Removes a previously added Redis Pub/Sub channel from the ChannelSubscription.
-func (s *ChannelSubscription) Remove(chans ...string) {
+func (s *ChannelSubscription) Remove(channels ...string) {
 	if s.closed {
 		panic("tried to use a closed subscription")
 	}
-	for _, ch := range chans {
+	for _, ch := range channels {
 		node, ok := s.channels[ch]
 		if ok {
 			s.mpx.reqCh <- request{subscriptionRemove, ch, node}
 			delete(s.channels, ch)
 		}
 	}
-}
-
-// Checks if a given Redis Pub/Sub channel is part of this ChannelSubscription.
-// Complexity is O(1).
-func (s ChannelSubscription) HasChannel(ch string) bool {
-	if s.closed {
-		panic("tried to use a closed subscription")
-	}
-	_, ok := s.channels[ch]
-	return ok
-}
-
-// Returns a list of all Redis Pub/Sub channels present in the ChannelSubscription.
-// The list is computed on-demand.
-func (s ChannelSubscription) GetChannels() []string {
-	if s.closed {
-		panic("tried to use a closed subscription")
-	}
-	chList := make([]string, len(s.channels))
-
-	var idx int
-	for ch := range s.channels {
-		chList[idx] = ch
-		idx += 1
-	}
-
-	return chList
 }
 
 // Removes all Redis Pub/Sub channels from the ChannelSubscription.

@@ -10,10 +10,11 @@ import (
 // A PromiseSubscription allows you to wait for individual Redis Pub/Sub messages
 // with support for timeouts. This effectively creates a networked promise system.
 // It makes use of a PatternSubscription internally to make creating new promises
-// as lightweight as possible (no subscrube/unsubscribe command is sent to Redis
-// to fullfill or expire a Promise). Unlike other types of subscriptions,
-// PromiseSubscriptions *are* safe for concurrent use
-// Consider always calling WaitForActivation after creating a new PromiseSubscription.
+// as lightweight as possible (no subscribe/unsubscribe command is sent to Redis
+// to fullfill or expire a Promise).
+//
+// Unlike other types of subscriptions, PromiseSubscriptions *are* safe for concurrent use.
+// You will probably want to call WaitForActivation after creating a new PromiseSubscription.
 type PromiseSubscription struct {
 	patSub         *PatternSubscription
 	prefix         string
@@ -124,7 +125,7 @@ func (p *PromiseSubscription) WaitForActivation() (ok bool) {
 // the function returns. All waiters will also be unlocked if the subscription
 // gets closed, so it's important to check the second return value before
 // attempting to use the returned Promise. Closing the subscription is
-// the only way of making this function fail.
+// the only way to make this function fail.
 //
 //  if promise, ok := sub.WaitForNewPromise(pfx, t_out); ok {
 //     // make use of the promise
@@ -200,6 +201,8 @@ func (p *PromiseSubscription) locklessNewPromise(suffix string, timeout time.Dur
 	return promise, nil
 }
 
+// Fails all outstanding Promises and closes the subscription.
+// Calling Close on a closed subscription will trigger a panic.
 func (p *PromiseSubscription) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()

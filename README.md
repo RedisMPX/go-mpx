@@ -7,9 +7,9 @@ RedisMPX is a Redis Pub/Sub multiplexer written in multiple languages and liveco
 - [Twitch channel](https://twitch.tv/kristoff_it)
 - [YouTube VOD archive](https://www.youtube.com/user/Kappaloris/videos)
 
-
 ## Status
-Main functionality completed, needs testing.
+Main functionality completed, needs testing. In the future I'll write a fuzzer to 
+test for all the possible concurrency combinations.
 
 ## Features
 - Simple channel subscriptions

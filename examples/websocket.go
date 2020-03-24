@@ -57,7 +57,7 @@ func main() {
 			}
 		}
 
-		sub := multiplexer.NewSubscription(onMessage, onDisconnect, onActivation)
+		sub := multiplexer.NewChannelSubscription(onMessage, onDisconnect, onActivation)
 
 		// Start the reader gorotuine associated with this WS.
 		go func(conn *websocket.Conn) {
