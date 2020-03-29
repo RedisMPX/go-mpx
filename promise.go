@@ -117,7 +117,7 @@ func (p *PromiseSubscription) WaitForActivation() (ok bool) {
 	}
 
 	p.activationCond.Wait()
-	return p.closed
+	return !p.closed
 }
 
 // Like NewPromise, but it will wait for the PromiseSubscription to become
@@ -204,11 +204,13 @@ func (p *PromiseSubscription) locklessNewPromise(suffix string, timeout time.Dur
 // Fails all outstanding Promises and closes the subscription.
 // Calling Close on a closed subscription will trigger a panic.
 func (p *PromiseSubscription) Close() {
+	println("tring to close")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		panic("tried to use a alread closed PromiseSubscription")
 	}
+	println("closing")
 
 	p.closed = true
 	p.exit <- struct{}{}

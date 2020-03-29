@@ -1,16 +1,20 @@
 # go-mpx
-RedisMPX implementation for the Go programming language.
+RedisMPX is a Redis Pub/Sub multiplexer library written in multiple languages and [live coded on Twitch](https://twitch.tv/kristoff_it).
+
+The live coding of this implementation is [archived on YouTube](https://www.youtube.com/watch?v=w6CyJ5dlFd4&list=PLVnMKELF_8IRJ37dW799IxkztIm1Dk3Az).
 
 ## Abstract
-RedisMPX is a Redis Pub/Sub multiplexer written in multiple languages and livecoded on Twitch.
+When bridging multiple application instances through Redis Pub/Sub it's easy to end up needing
+support for multiplexing. RedisMPX streamlines this process in a consistent way across multiple
+languages by offering a consistent set of features that cover the most common use cases.
 
-- [Twitch channel](https://twitch.tv/kristoff_it)
-- [YouTube VOD archive](https://www.youtube.com/user/Kappaloris/videos)
+The library works under the assumption that you are going to create separate subscriptions
+for each client connected to your service (e.g. WebSockets clients):
 
-## Status
-Main functionality completed. No unit tests have been written as the real
-source of complexity is how goroutines and concurrency mix with network I/O etc.
-So instead of wasting effort with mostly useless unit tests, I aim to write a fuzzer for that purpose.
+- ChannelSubscription allows you to add and remove individual Redis
+  PubSub channels similarly to how a multi-room chat application would need to.
+- PatternSubscription allows you to subscribe to a single Redis Pub/Sub pattern.
+- PromiseSubscription allows you to create a networked promise system.
 
 ## Features
 - Simple channel subscriptions

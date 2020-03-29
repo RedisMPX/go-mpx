@@ -51,11 +51,11 @@ func (s *ChannelSubscription) Add(channels ...string) {
 		panic("tried to use a closed subscription")
 	}
 	for _, ch := range channels {
-		_, ok := s.channels[ch]
+		_, ok := s.Channels[ch]
 		if !ok {
 			node := list.NewElement(s)
 			s.mpx.reqCh <- request{subscriptionAdd, ch, node}
-			s.channels[ch] = node
+			s.Channels[ch] = node
 		}
 	}
 }
@@ -68,10 +68,10 @@ func (s *ChannelSubscription) Remove(channels ...string) {
 		panic("tried to use a closed subscription")
 	}
 	for _, ch := range channels {
-		node, ok := s.channels[ch]
+		node, ok := s.Channels[ch]
 		if ok {
 			s.mpx.reqCh <- request{subscriptionRemove, ch, node}
-			delete(s.channels, ch)
+			delete(s.Channels, ch)
 		}
 	}
 }
@@ -81,12 +81,12 @@ func (s *ChannelSubscription) Clear() {
 	if s.closed {
 		panic("tried to use a closed ChannelSubscription")
 	}
-	for ch := range s.channels {
+	for ch := range s.Channels {
 		s.Remove(ch)
 	}
 
 	// Reset our internal state
-	s.channels = make(map[string]*list.Element)
+	s.Channels = make(map[string]*list.Element)
 }
 
 // Calls Clear and frees all references from the Multiplexer.

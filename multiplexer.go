@@ -7,7 +7,6 @@ package mpx
 
 import (
 	"errors"
-	"fmt"
 	"github.com/RedisMPX/go-mpx/internal"
 	"github.com/RedisMPX/go-mpx/internal/list"
 	"github.com/gomodule/redigo/redis"
@@ -57,8 +56,8 @@ type request struct {
 type Multiplexer struct {
 	// Options
 	pingTimeout     time.Duration
-	minBackOff      time.Duration
-	maxBackOff      time.Duration
+	minBackoff      time.Duration
+	maxBackoff      time.Duration
 	pipeliningSlots []request
 
 	// state
@@ -66,6 +65,8 @@ type Multiplexer struct {
 	pubsub           redis.PubSubConn
 	channels         map[string]*list.List
 	patterns         map[string]*list.List
+	active_channels  map[string]struct{}
+	active_patterns  map[string]struct{}
 	reqCh            chan request
 	stop             chan struct{}
 	exit             chan struct{}
@@ -100,20 +101,22 @@ func New(createConn func() (redis.Conn, error)) *Multiplexer {
 func NewWithOpts(
 	createConn func() (redis.Conn, error),
 	pingTimeout time.Duration,
-	minBackOff time.Duration,
-	maxBackOff time.Duration,
+	minBackoff time.Duration,
+	maxBackoff time.Duration,
 	messagesBufSize uint,
 	pipeliningBufSize uint,
 ) *Multiplexer {
 	mpx := Multiplexer{
 		pingTimeout:      pingTimeout,
-		minBackoff:       minBackOff,
+		minBackoff:       minBackoff,
 		maxBackoff:       maxBackoff,
 		pipeliningSlots:  make([]request, pipeliningBufSize),
 		pubsub:           redis.PubSubConn{Conn: nil},
 		createConn:       createConn,
 		channels:         make(map[string]*list.List),
 		patterns:         make(map[string]*list.List),
+		active_channels:  make(map[string]struct{}),
+		active_patterns:  make(map[string]struct{}),
 		reqCh:            make(chan request, 100),
 		stop:             make(chan struct{}),
 		exit:             make(chan struct{}),
@@ -267,7 +270,7 @@ func (mpx *Multiplexer) openNewConnection() {
 			break
 		}
 		if errorCount > 0 {
-			time.Sleep(internal.RetryBackoff(errorCount, mpx.minBackOff, mpx.maxBackOff))
+			time.Sleep(internal.RetryBackoff(errorCount, mpx.minBackoff, mpx.maxBackoff))
 		}
 		errorCount++
 	}
@@ -301,6 +304,10 @@ func (mpx *Multiplexer) connectionGoroutine() {
 					return
 				}
 			}
+
+			// Reset the active channel / pattern sets.
+			mpx.active_channels = make(map[string]struct{})
+			mpx.active_patterns = make(map[string]struct{})
 		}
 
 		// Start an "emergency" goroutine that keeps processing
@@ -458,27 +465,21 @@ func (mpx *Multiplexer) processRequests(requests []request, networkIO bool) erro
 					// Subscribe in Redis
 					sub = append(sub, req.name)
 				}
-			} else {
-				// We were already subscribed to that channel
-				if networkIO {
-					// If we are not in offline-mode, we immediately send confirmation
-					// that the subscription is active. If we are in the case where
-					// we just lost connectivity and processRequestGoroutine has not yet
-					// noticed, we will send a wrong notification, but we will also soon
-					// send a onDisconnect notification, after this goroutine exits, thus
-					// rectifying our wrong communication.
-					if onActivation := req.node.Value.(*ChannelSubscription).onActivation; onActivation != nil {
-						onActivation(req.name)
-					}
+			}
+
+			// Trigger onActivation if the subscription is already active.
+			if _, active := mpx.active_channels[req.name]; active {
+				if onActivation := req.node.Value.(*ChannelSubscription).onActivation; onActivation != nil {
+					onActivation(req.name)
 				}
 			}
+
 		case subscriptionRemove:
 			if listeners := req.node.DetachFromList(); listeners != nil {
 				if listeners.Len() > 0 {
-					fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
 				} else {
-					fmt.Printf("[ws] unsubbed also from Redis\n")
 					delete(mpx.channels, req.name)
+					delete(mpx.active_channels, req.name)
 					if networkIO {
 						unsub = append(unsub, req.name)
 					}
@@ -509,18 +510,12 @@ func (mpx *Multiplexer) processRequests(requests []request, networkIO bool) erro
 					// PSubscribe in Redis
 					psub = append(psub, req.name)
 				}
-			} else {
-				// We were already subscribed to that channel
-				if networkIO {
-					// If we are not in offline-mode, we immediately send confirmation
-					// that the subscription is active. If we are in the case where
-					// we just lost connectivity and processRequestGoroutine has not yet
-					// noticed, we will send a wrong notification, but we will also soon
-					// send a onDisconnect notification, after this goroutine exits, thus
-					// rectifying our wrong communication.
-					if onActivation := req.node.Value.(*PatternSubscription).onActivation; onActivation != nil {
-						onActivation(req.name)
-					}
+			}
+
+			// Trigger onActivation if the subscription is already active.
+			if _, active := mpx.active_patterns[req.name]; active {
+				if onActivation := req.node.Value.(*PatternSubscription).onActivation; onActivation != nil {
+					onActivation(req.name)
 				}
 			}
 		case patternClose:
@@ -531,10 +526,9 @@ func (mpx *Multiplexer) processRequests(requests []request, networkIO bool) erro
 			onMessageNode := req.node.Value.(*PatternSubscription).onMessageNode
 			if listeners := onMessageNode.DetachFromList(); listeners != nil {
 				if listeners.Len() > 0 {
-					fmt.Printf("[ws] unsubbed but more remaining (%v)\n", listeners.Len())
 				} else {
-					fmt.Printf("[ws] unsubbed also from Redis\n")
 					delete(mpx.patterns, req.name)
+					delete(mpx.active_patterns, req.name)
 					if networkIO {
 						punsub = append(punsub, req.name)
 					}
@@ -711,7 +705,6 @@ func (mpx *Multiplexer) messageReadingGoroutine(size int) {
 			// TODO: ask redigo do accept pings also from the pubsub
 			//       interface.
 			if !strings.HasSuffix(msg.Error(), "got type string") {
-				fmt.Printf("error in Pubsub: %v", msg)
 				mpx.triggerReconnect(msg)
 				return
 			}
