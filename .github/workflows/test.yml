@@ -1,4 +1,4 @@
-name: Python package
+name: Golang Tests
 
 on:
   push:
@@ -12,6 +12,9 @@ jobs:
     - uses: actions/setup-go@v2-beta
       with:
         go-version: '1.14' # The Go version to download (if necessary) and use.
+    - name: Install and run Redis
+      run: |
+        sudo apt-get install redis
     - run: go test
 
 
